@@ -26,9 +26,16 @@ aim scan
 # List registered models
 aim list
 aim list --engine comfyui --sort size
+aim list --json                      # JSON array output
 
 # Show model details
 aim info <model_id>
+aim info <model_id> --json           # full metadata as JSON
+
+# Resolve model to absolute path (for inference)
+aim resolve <model_id>               # prints absolute path
+aim resolve <model_id> --json        # full metadata + path + resolved_file
+aim resolve <model_id> --engine comfyui  # prefer engine provision path
 
 # Organize models into canonical store (preview)
 aim organize
@@ -61,6 +68,37 @@ aim dedup --apply
 # Find unregistered model files
 aim orphans
 ```
+
+## JSON Output
+
+`aim list`, `aim info`, and `aim resolve` support `--json` for programmatic integration.
+
+`aim resolve <id> --json` is the recommended single-call API — it returns the full model
+metadata (superset of `aim info --json`) plus two extra fields:
+
+```jsonc
+{
+  "id": "whisper-large-v3-turbo",
+  "name": "whisper-large-v3-turbo",
+  "source": { "type": "local", "repo_id": "openai/whisper-large-v3-turbo" },
+  "format": "pt",
+  "size_bytes": 1617941637,
+  "category": "asr/model",
+  "engines": ["whisper"],
+  // ... all other model fields ...
+  "path": "/Users/you/AI/store/asr/model/whisper-large-v3-turbo",
+  "resolved_file": "/Users/you/AI/store/asr/model/whisper-large-v3-turbo/large-v3-turbo.pt"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `path` | Absolute directory (or file) path, resolved via provision or canonical store |
+| `resolved_file` | Primary weight file inside the directory, or `null` for sharded / complex models |
+
+`resolved_file` detection: scans top-level weight files (`.safetensors`, `.pt`, `.pth`, `.gguf`,
+`.bin`, `.onnx`). Single file → returned directly. Multiple → picks largest matching format.
+Sharded models (`model-00001-of-00006`) → `null` (load from directory).
 
 ## Store Layout
 
