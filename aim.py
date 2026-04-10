@@ -1838,6 +1838,47 @@ def op_root_list(config: dict) -> None:
         print(f"{r['id']:<15} {r.get('label', ''):<20} {r['path']:<40} {used:<12} {free:<12}")
 
 
+# ── Path Resolution ────────────────────────────────────────────────────────
+
+WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}
+
+
+def _resolve_weight_file(model_dir: Path, fmt: str) -> Optional[str]:
+    """Find the primary weight file in a model directory. Returns absolute path or None."""
+    if model_dir.is_file():
+        return str(model_dir.resolve())
+    if not model_dir.is_dir():
+        return None
+
+    # Collect weight files at top level (skip hidden entries)
+    weights = [f for f in model_dir.iterdir()
+               if f.is_file() and not f.name.startswith(".") and f.suffix.lower() in WEIGHT_EXTS]
+
+    if not weights:
+        return None
+    if len(weights) == 1:
+        return str(weights[0].resolve())
+
+    # Multiple: detect sharded models (model-00001-of-00006.safetensors)
+    if all(re.search(r"-\d{3,}-of-\d{3,}", f.stem) for f in weights):
+        return None  # sharded, caller should use directory
+
+    # Filter by model format if set
+    if fmt:
+        ext_map = {"safetensors": ".safetensors", "pt": ".pt", "pth": ".pth",
+                    "gguf": ".gguf", "bin": ".bin", "onnx": ".onnx", "ct2": ".bin"}
+        ext = ext_map.get(fmt)
+        if ext:
+            matched = [f for f in weights if f.suffix.lower() == ext]
+            if len(matched) == 1:
+                return str(matched[0].resolve())
+            if matched:
+                weights = matched
+
+    # Pick the largest weight file
+    return str(max(weights, key=lambda f: f.stat().st_size).resolve())
+
+
 # ── Display / Formatting ────────────────────────────────────────────────────
 
 
@@ -2130,7 +2171,9 @@ def main() -> None:
             resolved = str(Path(root.path) / model.canonical.get("path", ""))
         resolved = str(Path(resolved).resolve())
         if args.json_output:
-            out = {"model_id": model.id, "path": resolved, "engines": sorted(_get_engines(model)),
+            weight_file = _resolve_weight_file(Path(resolved), model.format)
+            out = {"model_id": model.id, "path": resolved, "resolved_file": weight_file,
+                   "engines": sorted(_get_engines(model)),
                    "category": model.category, "format": model.format}
             print(json.dumps(out, indent=2, ensure_ascii=False))
         else:
