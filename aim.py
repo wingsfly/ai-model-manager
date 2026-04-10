@@ -84,6 +84,7 @@ class ModelEntry:
     tags: list[str] = field(default_factory=list)
     canonical: dict = field(default_factory=dict)  # {"root": str, "path": str}
     native_cas: bool = False
+    engines: list[str] = field(default_factory=list)
     provisions: list[dict] = field(default_factory=list)
     added_at: str = ""
 
@@ -93,6 +94,23 @@ class ModelEntry:
     @classmethod
     def from_dict(cls, d: dict) -> "ModelEntry":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+def _get_engines(m: ModelEntry) -> set[str]:
+    """Get engine set for a model. Uses engines field, falls back to provisions/source."""
+    if m.engines:
+        return set(m.engines)
+    engines: set[str] = set()
+    if m.native_cas:
+        engines.add(m.source.get("type", "unknown"))
+    for p in m.provisions:
+        engines.add(p.get("engine", "unknown"))
+    if not engines:
+        # try to infer from tags
+        for tag in m.tags:
+            if tag in ENGINE_NAMES:
+                engines.add(tag)
+    return engines or {"unprovisioned"}
 
 
 @dataclass
@@ -229,9 +247,7 @@ class Registry:
     ) -> list[ModelEntry]:
         result = self.models[:]
         if engine:
-            result = [m for m in result
-                      if any(p.get("engine") == engine for p in m.provisions)
-                      or (m.native_cas and m.source.get("type") == engine)]
+            result = [m for m in result if engine in _get_engines(m)]
         if category:
             result = [m for m in result if m.category.startswith(category)]
         if fmt:
@@ -1004,6 +1020,9 @@ def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[S
                 # update size if different
                 if s.size_bytes and s.size_bytes != existing.size_bytes:
                     existing.size_bytes = s.size_bytes
+                # track engine association
+                if s.engine and s.engine not in existing.engines:
+                    existing.engines.append(s.engine)
                 # add provision if not already tracked and not native_cas
                 if not s.native_cas:
                     prov_targets = {p.get("target") for p in existing.provisions}
@@ -1023,6 +1042,7 @@ def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[S
                     tags=s.tags,
                     canonical=canonical,
                     native_cas=s.native_cas,
+                    engines=[s.engine] if s.engine else [],
                     provisions=[],
                     added_at=datetime.now(timezone.utc).isoformat(),
                 )
@@ -1841,12 +1861,7 @@ def display_model_list(models: list[ModelEntry], show_provisions: bool = False) 
     print("─" * 130)
 
     for m in models:
-        engines = set()
-        if m.native_cas:
-            engines.add(m.source.get("type", "?"))
-        for p in m.provisions:
-            engines.add(p.get("engine", ""))
-        engines_str = ", ".join(sorted(engines)) if engines else "-"
+        engines_str = ", ".join(sorted(_get_engines(m)))
 
         print(f"{m.id:<35} {m.name[:29]:<30} {m.category:<22} {m.format:<15} {format_size(m.size_bytes):<12} {engines_str}")
 
@@ -1866,6 +1881,7 @@ def display_model_info(model: ModelEntry, show_provisions: bool = False) -> None
     print(f"Source:     {json.dumps(model.source)}")
     print(f"Canonical:  {model.canonical.get('root', '?')}:{model.canonical.get('path', '?')}")
     print(f"Native CAS: {model.native_cas}")
+    print(f"Engines:    {', '.join(sorted(_get_engines(model)))}")
     print(f"Tags:       {', '.join(model.tags)}")
     print(f"Added:      {model.added_at}")
 
@@ -1894,13 +1910,7 @@ def display_status(config: dict, registry: Registry, group_by: str = "engine") -
     if group_by == "engine":
         groups: dict[str, list[ModelEntry]] = {}
         for m in models:
-            engines = set()
-            if m.native_cas:
-                engines.add(m.source.get("type", "unknown"))
-            for p in m.provisions:
-                engines.add(p.get("engine", "unknown"))
-            if not engines:
-                engines.add("unprovisioned")
+            engines = _get_engines(m)
             for e in engines:
                 groups.setdefault(e, []).append(m)
 
