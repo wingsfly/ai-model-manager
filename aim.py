@@ -1968,15 +1968,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--for", type=str, default="", dest="for_engine", help="Show models usable by engine")
     p.add_argument("--sort", choices=["name", "size"], default="name", help="Sort order")
     p.add_argument("--provisions", action="store_true", help="Show provision details")
+    p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
 
     # info
     p = sub.add_parser("info", help="Show model details")
     p.add_argument("model_id", type=str)
     p.add_argument("--provisions", action="store_true", help="Show provision details")
+    p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
 
     # status
     p = sub.add_parser("status", help="Storage overview")
     p.add_argument("--by", choices=["engine", "category", "root"], default="engine", help="Group by")
+
+    # resolve
+    p = sub.add_parser("resolve", help="Resolve model to absolute path")
+    p.add_argument("model_id", type=str)
+    p.add_argument("--engine", type=str, default="", help="Prefer provision path for engine")
+    p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
 
     # download
     p = sub.add_parser("download", help="Download a model")
@@ -2073,12 +2081,18 @@ def main() -> None:
     elif cmd == "list":
         engine = args.for_engine or args.engine
         models = registry.list_models(engine=engine, category=args.category, fmt=args.fmt, sort_by=args.sort)
-        display_model_list(models, show_provisions=args.provisions)
+        if args.json_output:
+            print(json.dumps([m.to_dict() for m in models], indent=2, ensure_ascii=False))
+        else:
+            display_model_list(models, show_provisions=args.provisions)
 
     elif cmd == "info":
         model = registry.find(args.model_id)
         if model:
-            display_model_info(model, show_provisions=args.provisions)
+            if args.json_output:
+                print(json.dumps(model.to_dict(), indent=2, ensure_ascii=False))
+            else:
+                display_model_info(model, show_provisions=args.provisions)
         else:
             # try fuzzy search
             matches = registry.search(args.model_id)
@@ -2091,6 +2105,36 @@ def main() -> None:
 
     elif cmd == "status":
         display_status(config, registry, group_by=args.by)
+
+    elif cmd == "resolve":
+        model = registry.find(args.model_id)
+        if not model:
+            matches = registry.search(args.model_id)
+            if matches:
+                print(f"Model '{args.model_id}' not found. Did you mean:", file=sys.stderr)
+                for m in matches[:5]:
+                    print(f"  {m.id}", file=sys.stderr)
+            else:
+                print(f"Model '{args.model_id}' not found.", file=sys.stderr)
+            sys.exit(1)
+        root = get_primary_root(config)
+        # Prefer provision path for the requested engine
+        resolved = ""
+        if args.engine and model.provisions:
+            for p in model.provisions:
+                if p.get("engine") == args.engine:
+                    resolved = str(Path(root.path) / p["target"])
+                    break
+        # Fall back to canonical path
+        if not resolved:
+            resolved = str(Path(root.path) / model.canonical.get("path", ""))
+        resolved = str(Path(resolved).resolve())
+        if args.json_output:
+            out = {"model_id": model.id, "path": resolved, "engines": sorted(_get_engines(model)),
+                   "category": model.category, "format": model.format}
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+        else:
+            print(resolved)
 
     elif cmd == "download":
         op_download(config, registry, args.source, name=args.name, category=args.category)
