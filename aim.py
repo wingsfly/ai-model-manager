@@ -723,7 +723,7 @@ class WhisperAdapter(EngineAdapter):
                     size_bytes=total_size,
                     category="asr/model",
                     tags=["whisper", "faster-whisper"],
-                    native_cas=True,
+                    native_cas=self.native_cas,
                     is_directory=True,
                 ))
         return results
