@@ -2172,9 +2172,10 @@ def main() -> None:
         resolved = str(Path(resolved).resolve())
         if args.json_output:
             weight_file = _resolve_weight_file(Path(resolved), model.format)
-            out = {"model_id": model.id, "path": resolved, "resolved_file": weight_file,
-                   "engines": sorted(_get_engines(model)),
-                   "category": model.category, "format": model.format}
+            out = model.to_dict()
+            out["path"] = resolved
+            out["resolved_file"] = weight_file
+            out["engines"] = sorted(_get_engines(model))
             print(json.dumps(out, indent=2, ensure_ascii=False))
         else:
             print(resolved)
