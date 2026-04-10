@@ -22,6 +22,5 @@ venv/
 .DS_Store
 Thumbs.db
 
-# aim runtime data (lives in ~/AI/.aim/, not in repo)
-.aim/
+# aim runtime data (lives in ~/.aim/ and ~/AI/store/, not in repo)
 store/

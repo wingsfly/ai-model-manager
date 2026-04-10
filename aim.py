@@ -23,7 +23,7 @@ from typing import Any, Optional
 # ── Constants ────────────────────────────────────────────────────────────────
 
 VERSION = "0.1.0"
-AIM_DIR = ".aim"
+AIM_HOME = Path.home() / ".aim"
 CONFIG_FILE = "config.json"
 REGISTRY_FILE = "registry.json"
 STORE_DIR = "store"
@@ -52,10 +52,6 @@ class StorageRoot:
     path: str
     label: str = ""
     priority: int = 1
-
-    @property
-    def aim_dir(self) -> Path:
-        return Path(self.path) / AIM_DIR
 
     @property
     def store_path(self) -> Path:
@@ -142,18 +138,17 @@ def default_config() -> dict:
     }
 
 
-def load_config(root_path: Path) -> dict:
-    config_path = root_path / AIM_DIR / CONFIG_FILE
+def load_config() -> dict:
+    config_path = AIM_HOME / CONFIG_FILE
     if config_path.exists():
         with open(config_path) as f:
             return json.load(f)
     return default_config()
 
 
-def save_config(root_path: Path, config: dict) -> None:
-    aim_dir = root_path / AIM_DIR
-    aim_dir.mkdir(parents=True, exist_ok=True)
-    with open(aim_dir / CONFIG_FILE, "w") as f:
+def save_config(config: dict) -> None:
+    AIM_HOME.mkdir(parents=True, exist_ok=True)
+    with open(AIM_HOME / CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
@@ -173,9 +168,8 @@ def get_primary_root(config: dict) -> StorageRoot:
 
 
 class Registry:
-    def __init__(self, root_path: Path):
-        self.root_path = root_path
-        self.registry_path = root_path / AIM_DIR / REGISTRY_FILE
+    def __init__(self):
+        self.registry_path = AIM_HOME / REGISTRY_FILE
         self.models: list[ModelEntry] = []
         self._load()
 
@@ -188,7 +182,7 @@ class Registry:
             self.models = []
 
     def save(self) -> None:
-        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        AIM_HOME.mkdir(parents=True, exist_ok=True)
         # backup before save
         if self.registry_path.exists():
             backup = self.registry_path.with_suffix(".json.bak")
@@ -1799,12 +1793,10 @@ def op_root_add(config: dict, path: str, label: str = "") -> None:
     new_root = {"id": rid, "path": str(root_path), "label": label or str(root_path), "priority": len(existing_ids) + 1}
     config.setdefault("roots", []).append(new_root)
 
-    # Create aim dir and store in new root
-    (root_path / AIM_DIR).mkdir(exist_ok=True)
+    # Create store in new root
     (root_path / STORE_DIR).mkdir(exist_ok=True)
 
-    primary_root = Path(config["roots"][0]["path"])
-    save_config(primary_root, config)
+    save_config(config)
     print(f"Added root: {rid} → {root_path}")
 
 
@@ -2055,11 +2047,11 @@ def main() -> None:
 
     # Determine root path
     root_path = Path(args.root).expanduser().resolve() if args.root else Path.home() / "AI"
-    config = load_config(root_path)
-    registry = Registry(root_path)
+    config = load_config()
+    registry = Registry()
 
-    # Ensure aim dir exists
-    (root_path / AIM_DIR).mkdir(parents=True, exist_ok=True)
+    # Ensure aim home exists
+    AIM_HOME.mkdir(parents=True, exist_ok=True)
 
     cmd = args.command
 

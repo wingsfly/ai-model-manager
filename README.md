@@ -89,7 +89,7 @@ aim orphans
 
 ## Configuration
 
-Config is stored at `~/AI/.aim/config.json`. Registry at `~/AI/.aim/registry.json`.
+Config is stored at `~/.aim/config.json`. Registry at `~/.aim/registry.json`.
 
 ## Requirements
 
