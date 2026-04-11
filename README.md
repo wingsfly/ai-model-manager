@@ -9,6 +9,12 @@ Unified CLI for managing AI models across multiple inference engines.
 - **Deduplication**: Detect and deduplicate identical model files across engines via hardlinks
 - **Registry**: Track all models in a single JSON registry with metadata, provenance, and provision info
 
+## Docs
+
+- Download PRD: `docs/download-prd.md`
+- Download implementation plan: `docs/download-implementation-plan.md`
+- Download JSON contract: `docs/download-json-contract.md`
+
 ## Install
 
 ```bash
@@ -49,6 +55,14 @@ aim organize <model_id>
 # Download a model
 aim download hf:org/repo
 aim download ollama:model:tag
+aim download hf:org/repo --json
+aim download status <job_id> --json
+aim download cancel <job_id>
+aim download hf:org/repo --category llm/chat
+aim download hf:org/repo --path /custom/path
+aim download url:https://example.com/model.bin --no-progress
+aim download url:https://example.com/model.bin --no-resume
+aim download hf:org/repo --proxy http://127.0.0.1:7890 --retry 3 --retry-backoff 1.5
 
 # Provision a model for an engine
 aim provision <model_id> --engine comfyui
@@ -72,6 +86,7 @@ aim orphans
 ## JSON Output
 
 `aim list`, `aim info`, and `aim resolve` support `--json` for programmatic integration.
+`aim download --json` emits JSONL progress events and a final JSON summary.
 
 `aim resolve <id> --json` is the recommended single-call API — it returns the full model
 metadata (superset of `aim info --json`) plus two extra fields:
@@ -95,6 +110,18 @@ metadata (superset of `aim info --json`) plus two extra fields:
 |-------|-------------|
 | `path` | Absolute directory (or file) path, resolved via provision or canonical store |
 | `resolved_file` | Primary weight file inside the directory, or `null` for sharded / complex models |
+
+Download placement policy:
+
+1. `--path` has highest priority
+2. Else auto place under `store/<category>/<model_id>/`
+3. Missing category falls back to inferred category, then `uncategorized`
+
+Download control flags:
+
+1. `--no-progress`: only final summary (especially useful with `--json`)
+2. `--resume` / `--no-resume`: toggle resume behavior
+3. `--proxy --timeout --connect-timeout --retry --retry-backoff --max-speed --concurrency`
 
 `resolved_file` detection: scans top-level weight files (`.safetensors`, `.pt`, `.pth`, `.gguf`,
 `.bin`, `.onnx`). Single file → returned directly. Multiple → picks largest matching format.
@@ -134,6 +161,22 @@ Config is stored at `~/.aim/config.json`. Registry at `~/.aim/registry.json`.
 - Python 3.10+
 - macOS / Linux
 - Optional: `gh` CLI, `hfd.sh` for downloads
+
+## Testing
+
+```bash
+# Run syntax check
+make lint
+
+# Run all tests (unit + e2e)
+make test
+
+# Run only unit tests
+make test-unit
+
+# Run only end-to-end tests
+make test-e2e
+```
 
 ## License
 

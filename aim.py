@@ -10,6 +10,8 @@ import json
 import os
 import platform
 import re
+import signal
+import select
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,14 @@ AIM_HOME = Path.home() / ".aim"
 CONFIG_FILE = "config.json"
 REGISTRY_FILE = "registry.json"
 STORE_DIR = "store"
+DOWNLOAD_JOBS_DIR = "download-jobs"
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_CANCELED = 2
+EXIT_INVALID_ARGS = 3
+EXIT_BACKEND_MISSING = 4
+EXIT_AUTH_FAILED = 5
 
 CATEGORIES = [
     "llm/chat", "llm/code", "llm/embedding", "llm/vision",
@@ -129,6 +139,32 @@ class ScannedModel:
     is_directory: bool = False
 
 
+@dataclass
+class DownloadOptions:
+    proxy: str = ""
+    timeout: int = 0
+    connect_timeout: int = 0
+    retry: int = 0
+    retry_backoff: float = 0.0
+    max_speed: str = ""
+    concurrency: int = 0
+    verify_ssl: bool = True
+    backend_args: list[str] = field(default_factory=list)
+    quiet_output: bool = False
+    no_progress: bool = False
+    resume: bool = True
+
+
+@dataclass
+class DownloadResult:
+    success: bool
+    canceled: bool = False
+    backend_tool: str = ""
+    backend_command: list[str] = field(default_factory=list)
+    error_code: str = ""
+    error_message: str = ""
+
+
 # ── Config ───────────────────────────────────────────────────────────────────
 
 
@@ -141,6 +177,16 @@ def default_config() -> dict:
         "defaults": {
             "link_type": "auto",
             "hf_download_tool": "hfd",
+        },
+        "download": {
+            "proxy": "",
+            "timeout": 0,
+            "connect_timeout": 0,
+            "retry": 2,
+            "retry_backoff": 1.5,
+            "max_speed": "",
+            "concurrency": 0,
+            "verify_ssl": True,
         },
         "engines": {
             "ollama":      {"enabled": True, "model_dir": "ollama/models", "native_cas": True},
@@ -1056,13 +1102,75 @@ def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[S
     return all_scanned
 
 
-def op_download(config: dict, registry: Registry, source_str: str,
-                name: str = "", category: str = "") -> Optional[ModelEntry]:
-    """Download a model from a source."""
-    root = get_primary_root(config)
-    store = root.store_path
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    # Parse source
+
+def _jobs_dir() -> Path:
+    d = AIM_HOME / DOWNLOAD_JOBS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _job_file(job_id: str) -> Path:
+    return _jobs_dir() / f"{job_id}.json"
+
+
+def _write_job_state(job_id: str, state: dict) -> None:
+    fp = _job_file(job_id)
+    if fp.exists():
+        try:
+            with open(fp) as rf:
+                prev = json.load(rf)
+            if prev.get("cancel_requested"):
+                state["cancel_requested"] = True
+        except (json.JSONDecodeError, OSError):
+            pass
+    with open(fp, "w") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def _read_job_state(job_id: str) -> Optional[dict]:
+    fp = _job_file(job_id)
+    if not fp.exists():
+        return None
+    with open(fp) as f:
+        return json.load(f)
+
+
+def _emit_download_event(json_output: bool, event: dict) -> None:
+    if json_output:
+        print(json.dumps(event, ensure_ascii=False))
+        return
+    status = event.get("status", "unknown")
+    percent = event.get("percent")
+    if percent is not None:
+        print(f"[{status}] {percent:.0f}%")
+    else:
+        print(f"[{status}]")
+
+
+def _emit_download_summary(json_output: bool, summary: dict) -> None:
+    if json_output:
+        print(json.dumps(summary, ensure_ascii=False))
+        return
+    if summary.get("status") == "completed":
+        print(f"Registered: {summary['model_id']} ({format_size(summary.get('size_bytes', 0))})")
+        print(f"Path: {summary.get('path', '')}")
+    elif summary.get("status") == "already_exists":
+        print(f"Already exists: {summary['model_id']}")
+        print(f"Path: {summary.get('path', '')}")
+    elif summary.get("status") == "canceled":
+        print(f"Download canceled: {summary['model_id']}")
+    else:
+        print(f"Download failed: {summary.get('model_id', '')}")
+        err = summary.get("error") or {}
+        if err:
+            print(f"  {err.get('code', 'UNKNOWN')}: {err.get('message', '')}")
+
+
+def _parse_download_source(source_str: str, name: str = "") -> tuple[Optional[dict], str, str]:
     if source_str.startswith("hf:"):
         repo_id = source_str[3:]
         source = {"type": "huggingface", "repo_id": repo_id}
@@ -1083,119 +1191,1049 @@ def op_download(config: dict, registry: Registry, source_str: str,
         source = {"type": "modelscope", "repo_id": repo_id}
         model_id = name or repo_id.split("/")[-1].lower().replace(" ", "-")
     else:
-        print(f"Error: Unknown source format: {source_str}")
-        print("Supported: hf:org/repo, ollama:model:tag, url:https://..., ms:org/repo")
-        return None
-
+        return None, "", "Unknown source format"
     model_id = re.sub(r"[^a-z0-9._-]", "-", model_id.lower()).strip("-")
-    dest = store / model_id
-    dest.mkdir(parents=True, exist_ok=True)
+    return source, model_id, ""
 
-    print(f"Downloading {source_str} → {dest}")
 
-    # Execute download
-    success = False
-    if source["type"] == "huggingface":
-        success = _download_hf(source["repo_id"], dest, config)
-    elif source["type"] == "ollama":
-        success = _download_ollama(source["repo_id"].split("/")[-1], source.get("tag", "latest"))
-    elif source["type"] == "url":
-        success = _download_url(source["url"], dest)
-    elif source["type"] == "modelscope":
-        success = _download_modelscope(source["repo_id"], dest)
+def _infer_download_category(source: dict, model_id: str, explicit_category: str = "") -> str:
+    if explicit_category:
+        return explicit_category
+    text = " ".join([source.get("repo_id", ""), source.get("url", ""), model_id]).lower()
+    if any(k in text for k in ["whisper", "wav2vec", "w2v"]):
+        return "asr/model"
+    if any(k in text for k in ["tts", "kokoro", "piper", "sparktts", "fish-speech", "vocoder"]):
+        return "tts/model"
+    if any(k in text for k in ["vad", "silero-vad"]):
+        return "audio/vad"
+    if any(k in text for k in ["encodec", "codec", "snac"]):
+        return "audio/codec"
+    if any(k in text for k in ["lora"]):
+        return "image-gen/lora"
+    if any(k in text for k in ["vae"]):
+        return "image-gen/vae"
+    if any(k in text for k in ["flux", "stable-diffusion", "sdxl", "checkpoint", ".ckpt"]):
+        return "image-gen/checkpoint"
+    if any(k in text for k in ["embed", "embedding"]):
+        return "llm/embedding"
+    if any(k in text for k in ["vision", "vl"]):
+        return "llm/vision"
+    if any(k in text for k in ["code", "coder"]):
+        return "llm/code"
+    return "llm/chat"
 
-    if not success:
-        print("Download failed.")
+
+def _resolve_download_dest(root: StorageRoot, model_id: str, category: str, explicit_path: str = "") -> tuple[Path, str]:
+    if explicit_path:
+        return Path(explicit_path).expanduser(), "explicit"
+    final_category = category or "uncategorized"
+    return root.store_path / final_category / model_id, "auto"
+
+
+def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
+    cfg = config.get("download", {})
+    return DownloadOptions(
+        proxy=args.proxy if args.proxy is not None else cfg.get("proxy", ""),
+        timeout=args.timeout if args.timeout is not None else int(cfg.get("timeout", 0) or 0),
+        connect_timeout=args.connect_timeout if args.connect_timeout is not None else int(cfg.get("connect_timeout", 0) or 0),
+        retry=args.retry if args.retry is not None else int(cfg.get("retry", 0) or 0),
+        retry_backoff=args.retry_backoff if args.retry_backoff is not None else float(cfg.get("retry_backoff", 0.0) or 0.0),
+        max_speed=args.max_speed if args.max_speed is not None else cfg.get("max_speed", ""),
+        concurrency=args.concurrency if args.concurrency is not None else int(cfg.get("concurrency", 0) or 0),
+        verify_ssl=(not args.no_verify_ssl) if getattr(args, "no_verify_ssl", False) else bool(cfg.get("verify_ssl", True)),
+        backend_args=args.backend_args or [],
+        quiet_output=bool(getattr(args, "json_output", False)),
+        no_progress=bool(getattr(args, "no_progress", False)),
+        resume=bool(getattr(args, "resume", True)),
+    )
+
+
+def _map_download_error(message: str) -> tuple[str, int]:
+    m = (message or "").lower()
+    if any(k in m for k in ["401", "unauthorized", "authentication", "token"]):
+        return "AUTH_FAILED", EXIT_AUTH_FAILED
+    if any(k in m for k in ["forbidden", "403"]):
+        return "FORBIDDEN", EXIT_FAILED
+    if any(k in m for k in ["rate limit", "429"]):
+        return "RATE_LIMITED", EXIT_FAILED
+    if any(k in m for k in ["timeout", "timed out"]):
+        return "NETWORK_TIMEOUT", EXIT_FAILED
+    if any(k in m for k in ["no space left", "disk full"]):
+        return "DISK_FULL", EXIT_FAILED
+    if any(k in m for k in ["no such file or directory", "not found"]) and any(k in m for k in ["wget", "curl", "ollama", "huggingface-cli", "modelscope", "bash"]):
+        return "BACKEND_NOT_FOUND", EXIT_BACKEND_MISSING
+    return "UNKNOWN", EXIT_FAILED
+
+
+def _parse_rate_to_bps(token: str) -> Optional[float]:
+    raw = (token or "").strip().replace(",", "")
+    raw = raw.replace("/s", "").replace("ps", "")
+    if not raw:
+        return None
+    m = re.match(r"(?i)^([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?)?$", raw)
+    if not m:
+        return None
+    value = float(m.group(1))
+    unit = (m.group(2) or "b").lower()
+    factor = 1.0
+    if unit in ("k", "kb", "kib"):
+        factor = 1024
+    elif unit in ("m", "mb", "mib"):
+        factor = 1024 ** 2
+    elif unit in ("g", "gb", "gib"):
+        factor = 1024 ** 3
+    elif unit in ("t", "tb", "tib"):
+        factor = 1024 ** 4
+    return value * factor
+
+
+def _parse_size_to_bytes(token: str) -> Optional[int]:
+    raw = (token or "").strip().replace(",", "")
+    if not raw:
+        return None
+    m = re.match(r"(?i)^([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?)?$", raw)
+    if not m:
+        return None
+    value = float(m.group(1))
+    unit = (m.group(2) or "b").lower()
+    factor = 1.0
+    if unit in ("k", "kb", "kib"):
+        factor = 1024
+    elif unit in ("m", "mb", "mib"):
+        factor = 1024 ** 2
+    elif unit in ("g", "gb", "gib"):
+        factor = 1024 ** 3
+    elif unit in ("t", "tb", "tib"):
+        factor = 1024 ** 4
+    return int(value * factor)
+
+
+def _parse_eta_to_seconds(token: str) -> Optional[float]:
+    s = (token or "").strip().lower()
+    if not s:
+        return None
+    if re.match(r"^\d+:\d{2}:\d{2}$", s):
+        h, m, sec = s.split(":")
+        return float(int(h) * 3600 + int(m) * 60 + int(sec))
+    if re.match(r"^\d+:\d{2}$", s):
+        m, sec = s.split(":")
+        return float(int(m) * 60 + int(sec))
+    total = 0.0
+    found = False
+    for amount, unit in re.findall(r"(\d+)\s*([hms])", s):
+        found = True
+        if unit == "h":
+            total += int(amount) * 3600
+        elif unit == "m":
+            total += int(amount) * 60
+        else:
+            total += int(amount)
+    return total if found else None
+
+
+def _parse_progress_line(line: str, backend_tool: str = "") -> Optional[dict]:
+    text = (line or "").strip()
+    if not text:
+        return None
+    out: dict[str, Any] = {}
+    tool = (backend_tool or "").lower()
+    length_match = re.search(r"(?i)\blength:\s*([0-9,]+)", text)
+    if length_match:
+        total = _parse_size_to_bytes(length_match.group(1))
+        if total is not None:
+            out["total_bytes"] = total
+
+    if tool == "curl":
+        tokens = text.split()
+        if len(tokens) >= 12 and re.match(r"^\d+(?:\.\d+)?$", tokens[0]):
+            try:
+                p = float(tokens[0])
+                if 0 <= p <= 100:
+                    out["percent"] = p
+            except ValueError:
+                pass
+            speed = _parse_rate_to_bps(tokens[-1])
+            if speed is not None:
+                out["speed_bps"] = speed
+            eta_token = tokens[10] if len(tokens) > 10 else ""
+            if eta_token and "-" not in eta_token:
+                eta = _parse_eta_to_seconds(eta_token)
+                if eta is not None:
+                    out["eta_seconds"] = eta
+            total_bytes = _parse_size_to_bytes(tokens[1]) if len(tokens) > 1 else None
+            downloaded_bytes = _parse_size_to_bytes(tokens[3]) if len(tokens) > 3 else None
+            if downloaded_bytes is not None:
+                out["downloaded_bytes"] = downloaded_bytes
+            if total_bytes is not None:
+                out["total_bytes"] = total_bytes
+            if "percent" in out and "downloaded_bytes" in out and "total_bytes" not in out and out["percent"] >= 10:
+                out["total_bytes"] = int(out["downloaded_bytes"] * 100.0 / out["percent"])
+            return out if out else None
+
+    if tool in {"huggingface-cli", "modelscope", "hfd", "ollama"}:
+        size_pair = re.search(
+            r"([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B?)\s*/\s*([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if size_pair:
+            downloaded = _parse_size_to_bytes(size_pair.group(1))
+            total = _parse_size_to_bytes(size_pair.group(2))
+            if downloaded is not None:
+                out["downloaded_bytes"] = downloaded
+            if total is not None:
+                out["total_bytes"] = total
+                if downloaded is not None and total > 0:
+                    out["percent"] = min(100.0, max(0.0, (downloaded * 100.0) / total))
+        # aria2/hfd style: "(12%)"
+        p2 = re.search(r"\((\d{1,3}(?:\.\d+)?)%\)", text)
+        if p2 and "percent" not in out:
+            try:
+                out["percent"] = float(p2.group(1))
+            except ValueError:
+                pass
+        speed1 = re.search(r"(?i)\bDL[:\s]+([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B/s)\b", text)
+        speed2 = re.search(r"([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B/s)", text, flags=re.IGNORECASE)
+        speed_token = speed1.group(1) if speed1 else (speed2.group(1) if speed2 else "")
+        if speed_token:
+            speed = _parse_rate_to_bps(speed_token)
+            if speed is not None:
+                out["speed_bps"] = speed
+        eta1 = re.search(r"(?i)\beta[:\s]+([0-9hms:]+)", text)
+        if eta1:
+            eta = _parse_eta_to_seconds(eta1.group(1))
+            if eta is not None:
+                out["eta_seconds"] = eta
+        else:
+            # tqdm style: [00:15<00:20, 102MB/s]
+            eta2 = re.search(r"<\s*([0-9:]+)", text)
+            if eta2:
+                eta = _parse_eta_to_seconds(eta2.group(1))
+                if eta is not None:
+                    out["eta_seconds"] = eta
+        if out:
+            return out
+
+    if tool == "wget":
+        # Example: " 42% [=======> ] 44,040,704  11.2MB/s  eta 9s"
+        m = re.search(r"(\d{1,3}(?:\.\d+)?)%\s+\[[^\]]+\]\s+([0-9,]+)\s+([0-9.]+\s*[KMGT]?i?B?/s)?(?:\s+eta\s+([0-9hms:]+))?", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                percent = float(m.group(1))
+                if 0 <= percent <= 100:
+                    out["percent"] = percent
+            except ValueError:
+                pass
+            downloaded_bytes = _parse_size_to_bytes(m.group(2))
+            if downloaded_bytes is not None:
+                out["downloaded_bytes"] = downloaded_bytes
+            if "percent" in out and out["percent"] > 0 and downloaded_bytes is not None:
+                out["total_bytes"] = int(downloaded_bytes * 100.0 / out["percent"])
+            speed = _parse_rate_to_bps(m.group(3) or "")
+            if speed is not None:
+                out["speed_bps"] = speed
+            eta = _parse_eta_to_seconds(m.group(4) or "")
+            if eta is not None:
+                out["eta_seconds"] = eta
+            return out if out else None
+        speed_any = re.search(r"([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B/s)", text, flags=re.IGNORECASE)
+        if speed_any:
+            speed = _parse_rate_to_bps(speed_any.group(1))
+            if speed is not None:
+                out["speed_bps"] = speed
+        eta_any = re.search(r"(?i)\beta\s+([0-9hms:]+)", text)
+        if eta_any:
+            eta = _parse_eta_to_seconds(eta_any.group(1))
+            if eta is not None:
+                out["eta_seconds"] = eta
+        if out:
+            return out
+
+    p = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", text)
+    if p:
+        try:
+            percent = float(p.group(1))
+            if 0 <= percent <= 100:
+                out["percent"] = percent
+        except ValueError:
+            pass
+
+    # eta 1m 20s / ETA 00:12 / 0:00:17
+    eta_match = re.search(r"(?i)\beta\b[:\s]+([0-9hms:\s]+)", text)
+    if eta_match:
+        eta = _parse_eta_to_seconds(eta_match.group(1))
+        if eta is not None:
+            out["eta_seconds"] = eta
+    else:
+        t = re.findall(r"\b\d+:\d{2}(?::\d{2})?\b", text)
+        if t:
+            eta = _parse_eta_to_seconds(t[-1])
+            if eta is not None:
+                out["eta_seconds"] = eta
+
+    # prefer explicit B/s style; then curl/wget abbreviated speeds
+    speed_match = re.search(r"([0-9]+(?:\.[0-9]+)?\s*[KMGT]?i?B/s)", text, flags=re.IGNORECASE)
+    if speed_match:
+        bps = _parse_rate_to_bps(speed_match.group(1))
+        if bps is not None:
+            out["speed_bps"] = bps
+    elif "%" not in text and "eta" not in text.lower():
         return None
 
-    # Calculate size
+    return out or None
+
+
+def _run_command(
+    cmd: list[str],
+    env: Optional[dict],
+    job_state: dict,
+    quiet_output: bool = False,
+    backend_tool: str = "",
+    on_progress: Optional[Any] = None,
+    command_timeout: int = 0,
+) -> tuple[int, bool, str]:
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE if quiet_output else None,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+    except FileNotFoundError as e:
+        return 127, False, str(e)
+
+    job_state["child_pid"] = proc.pid
+    _write_job_state(job_state["job_id"], job_state)
+
+    canceled = False
+    start_at = time.time()
+    stderr_buf = ""
+    stdout_buf = ""
+    stderr_chunks: list[str] = []
+    stdout_chunks: list[str] = []
+    while True:
+        fds = []
+        if proc.stderr and not proc.stderr.closed:
+            fds.append(proc.stderr)
+        if proc.stdout and not proc.stdout.closed:
+            fds.append(proc.stdout)
+        if fds:
+            ready, _, _ = select.select(fds, [], [], 0.2)
+            for fd in ready:
+                try:
+                    chunk = os.read(fd.fileno(), 4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    continue
+                text = chunk.decode("utf-8", errors="replace")
+                if fd is proc.stderr:
+                    stderr_chunks.append(text)
+                    stderr_buf += text
+                    parts = re.split(r"[\r\n]+", stderr_buf)
+                    stderr_buf = parts[-1]
+                    for part in parts[:-1]:
+                        if on_progress:
+                            parsed = _parse_progress_line(part, backend_tool=backend_tool)
+                            if parsed:
+                                parsed.setdefault("backend_tool", backend_tool)
+                                on_progress(parsed)
+                else:
+                    stdout_chunks.append(text)
+                    stdout_buf += text
+
+        rc = proc.poll()
+        if rc is not None:
+            latest = _read_job_state(job_state["job_id"]) or {}
+            if latest.get("cancel_requested") and rc in (143, -15, 130):
+                canceled = True
+            if proc.stderr and not proc.stderr.closed:
+                while True:
+                    try:
+                        extra = os.read(proc.stderr.fileno(), 4096)
+                    except OSError:
+                        extra = b""
+                    if not extra:
+                        break
+                    text = extra.decode("utf-8", errors="replace")
+                    stderr_chunks.append(text)
+                    stderr_buf += text
+            if proc.stdout and not proc.stdout.closed:
+                while True:
+                    try:
+                        extra = os.read(proc.stdout.fileno(), 4096)
+                    except OSError:
+                        extra = b""
+                    if not extra:
+                        break
+                    text = extra.decode("utf-8", errors="replace")
+                    stdout_chunks.append(text)
+                    stdout_buf += text
+            if stderr_buf and on_progress:
+                parsed = _parse_progress_line(stderr_buf, backend_tool=backend_tool)
+                if parsed:
+                    parsed.setdefault("backend_tool", backend_tool)
+                    on_progress(parsed)
+            job_state["child_pid"] = None
+            _write_job_state(job_state["job_id"], job_state)
+            err = "".join(stderr_chunks).strip()
+            out = "".join(stdout_chunks).strip()
+            combined = "\n".join([s for s in [err, out] if s]).strip()
+            return rc, canceled, combined
+
+        latest = _read_job_state(job_state["job_id"]) or {}
+        if latest.get("cancel_requested"):
+            canceled = True
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        if command_timeout and (time.time() - start_at) > command_timeout:
+            canceled = False
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            time.sleep(0.2)
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            return 124, canceled, f"Command timeout after {command_timeout}s"
+        time.sleep(0.2)
+
+
+def _execute_backend_command(
+    cmd: list[str],
+    env: dict,
+    options: DownloadOptions,
+    job_state: dict,
+    backend_tool: str,
+    on_progress: Optional[Any] = None,
+) -> DownloadResult:
+    attempts = max(1, int(options.retry or 0) + 1)
+    last_err = ""
+    for i in range(attempts):
+        rc, canceled, stderr = _run_command(
+            cmd,
+            env,
+            job_state,
+            quiet_output=options.quiet_output,
+            backend_tool=backend_tool,
+            on_progress=on_progress,
+            command_timeout=int(options.timeout or 0),
+        )
+        if canceled:
+            return DownloadResult(success=False, canceled=True, backend_tool=backend_tool, backend_command=cmd, error_code="CANCELED", error_message="Canceled by user")
+        if rc == 0:
+            return DownloadResult(success=True, backend_tool=backend_tool, backend_command=cmd)
+        if rc == 127:
+            return DownloadResult(success=False, backend_tool=backend_tool, backend_command=cmd, error_code="BACKEND_NOT_FOUND", error_message=stderr or f"{backend_tool} not found")
+        last_err = stderr or f"Exit code {rc}"
+        if i < attempts - 1:
+            backoff = float(options.retry_backoff or 1.0)
+            delay = max(0.0, backoff ** i)
+            time.sleep(delay)
+    return DownloadResult(success=False, backend_tool=backend_tool, backend_command=cmd, error_message=last_err)
+
+
+def op_download_status(job_id: str, json_output: bool = False) -> int:
+    state = _read_job_state(job_id)
+    if not state:
+        if json_output:
+            print(json.dumps({"error": {"code": "JOB_NOT_FOUND", "message": f"Job '{job_id}' not found", "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Job '{job_id}' not found.")
+        return EXIT_FAILED
+    if json_output:
+        print(json.dumps(state, ensure_ascii=False))
+    else:
+        print(f"job_id: {state.get('job_id')}")
+        print(f"status: {state.get('status')}")
+        print(f"model_id: {state.get('model_id', '')}")
+        print(f"path: {state.get('path', '')}")
+        print(f"updated_at: {state.get('updated_at', '')}")
+    return EXIT_OK
+
+
+def op_download_cancel(job_id: str, json_output: bool = False) -> int:
+    state = _read_job_state(job_id)
+    if not state:
+        if json_output:
+            print(json.dumps({"error": {"code": "JOB_NOT_FOUND", "message": f"Job '{job_id}' not found", "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Job '{job_id}' not found.")
+        return EXIT_FAILED
+
+    state["cancel_requested"] = True
+    state["updated_at"] = _now_iso()
+    child_pid = state.get("child_pid")
+    if child_pid:
+        try:
+            os.kill(child_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    _write_job_state(job_id, state)
+
+    out = {"job_id": job_id, "status": "cancel_requested"}
+    if json_output:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Cancel requested for job {job_id}.")
+    return EXIT_OK
+
+
+def op_download(config: dict, registry: Registry, source_str: str,
+                name: str = "", category: str = "", path: str = "",
+                json_output: bool = False, options: Optional[DownloadOptions] = None,
+                force_redownload: bool = False) -> int:
+    """Download a model from a source."""
+    root = get_primary_root(config)
+    options = options or DownloadOptions()
+    source, model_id, parse_err = _parse_download_source(source_str, name=name)
+    if not source:
+        msg = parse_err or f"Unknown source format: {source_str}"
+        if json_output:
+            print(json.dumps({"error": {"code": "INVALID_SOURCE", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+            print("Supported: hf:org/repo, ollama:model:tag, url:https://..., ms:org/repo")
+        return EXIT_INVALID_ARGS
+
+    inferred = _infer_download_category(source, model_id, explicit_category=category)
+    final_category = category or inferred or "uncategorized"
+    dest, placement_mode = _resolve_download_dest(root, model_id, final_category, explicit_path=path)
+    dest = dest.resolve()
+    storage_mode = "native_cas" if source["type"] == "ollama" else "canonical_store"
+    if source["type"] != "ollama":
+        dest.mkdir(parents=True, exist_ok=True)
+
+    existing = registry.find(model_id)
+    existing_path_obj = None
+    if existing:
+        if existing.native_cas:
+            existing_path_obj = Path(root.path) / config.get("engines", {}).get("ollama", {}).get("model_dir", "ollama/models")
+        else:
+            existing_path_obj = Path(root.path) / existing.canonical.get("path", "")
+
+    if existing and existing_path_obj and existing_path_obj.exists() and not force_redownload:
+        existing_path = str(existing_path_obj.resolve())
+        summary = {
+            "job_id": f"dl-{int(time.time() * 1000)}-{os.getpid()}",
+            "status": "already_exists",
+            "model_id": model_id,
+            "source": source,
+            "path": existing_path,
+            "final_path": existing_path,
+            "category": existing.category or final_category,
+            "placement_mode": "existing",
+            "size_bytes": existing.size_bytes,
+            "duration_ms": 0,
+            "checksum": "",
+            "registered": True,
+            "storage_mode": "native_cas" if existing.native_cas else "canonical_store",
+            "backend_tool": "",
+            "backend_command": [],
+            "timestamp": _now_iso(),
+        }
+        _emit_download_summary(json_output, summary)
+        return EXIT_OK
+
+    job_id = f"dl-{int(time.time() * 1000)}-{os.getpid()}"
+    job_state = {
+        "job_id": job_id,
+        "status": "queued",
+        "source": source,
+        "model_id": model_id,
+        "path": str(dest),
+        "category": final_category,
+        "placement_mode": placement_mode if category else ("fallback" if placement_mode == "auto" else placement_mode),
+        "cancel_requested": False,
+        "pid": os.getpid(),
+        "child_pid": None,
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+    _write_job_state(job_id, job_state)
+
+    queued = {
+        "job_id": job_id,
+        "status": "queued",
+        "timestamp": _now_iso(),
+        "model_id": model_id,
+        "source": source,
+        "percent": 0,
+        "speed_bps": None,
+        "eta_seconds": None,
+        "downloaded_bytes": 0,
+        "total_bytes": None,
+    }
+    if not options.no_progress:
+        _emit_download_event(json_output, queued)
+
+    if not json_output:
+        print(f"Downloading {source_str} → {dest}")
+
+    start = time.time()
+    job_state["status"] = "downloading"
+    job_state["updated_at"] = _now_iso()
+    _write_job_state(job_id, job_state)
+    if not options.no_progress:
+        _emit_download_event(json_output, {
+            "job_id": job_id,
+            "status": "downloading",
+            "timestamp": _now_iso(),
+            "model_id": model_id,
+            "source": source,
+            "percent": 0,
+            "speed_bps": None,
+            "eta_seconds": None,
+            "downloaded_bytes": 0,
+            "total_bytes": None,
+        })
+
+    progress_state = {
+        "last_emit": 0.0,
+        "last_percent": -1.0,
+        "last_downloaded": 0,
+        "last_total": 0,
+        "last_speed": None,
+        "last_eta": None,
+        "backend_tool": None,
+        "last_sample_time": None,
+        "last_sample_downloaded": 0,
+    }
+
+    def _on_progress(progress: dict) -> None:
+        now = time.time()
+        if progress.get("backend_tool"):
+            progress_state["backend_tool"] = progress.get("backend_tool")
+
+        downloaded = progress.get("downloaded_bytes")
+        if isinstance(downloaded, (int, float)):
+            downloaded = int(downloaded)
+            if downloaded < progress_state["last_downloaded"]:
+                downloaded = progress_state["last_downloaded"]
+            progress_state["last_downloaded"] = downloaded
+        else:
+            downloaded = progress_state["last_downloaded"] or None
+
+        total = progress.get("total_bytes")
+        if isinstance(total, (int, float)):
+            total = int(total)
+            if total < progress_state["last_total"]:
+                total = progress_state["last_total"]
+            progress_state["last_total"] = total
+        else:
+            total = progress_state["last_total"] or None
+
+        percent = progress.get("percent")
+        if percent is not None:
+            try:
+                percent = max(0.0, min(100.0, float(percent)))
+            except (TypeError, ValueError):
+                percent = None
+        elif isinstance(downloaded, int) and isinstance(total, int) and total > 0:
+            percent = max(0.0, min(100.0, downloaded * 100.0 / total))
+
+        if percent is not None and percent < progress_state["last_percent"]:
+            percent = progress_state["last_percent"]
+
+        speed = progress.get("speed_bps")
+        if isinstance(speed, (int, float)):
+            progress_state["last_speed"] = float(speed)
+        else:
+            speed = progress_state["last_speed"]
+
+        if (speed is None or speed <= 0) and isinstance(downloaded, int):
+            prev_t = progress_state["last_sample_time"]
+            prev_b = progress_state["last_sample_downloaded"]
+            if isinstance(prev_t, (int, float)) and now > prev_t and downloaded >= prev_b:
+                dt = now - prev_t
+                db = downloaded - prev_b
+                if dt >= 0.2 and db > 0:
+                    speed = db / dt
+                    progress_state["last_speed"] = speed
+        if isinstance(downloaded, int):
+            progress_state["last_sample_time"] = now
+            progress_state["last_sample_downloaded"] = downloaded
+
+        eta = progress.get("eta_seconds")
+        if isinstance(eta, (int, float)):
+            progress_state["last_eta"] = float(eta)
+        else:
+            eta = progress_state["last_eta"]
+        if (eta is None or eta < 0) and isinstance(total, int) and isinstance(downloaded, int) and isinstance(speed, (int, float)) and speed > 0:
+            eta = max(0.0, (total - downloaded) / speed)
+            progress_state["last_eta"] = eta
+
+        if percent is None and now - progress_state["last_emit"] < 0.8:
+            return
+        if percent is not None and abs(percent - progress_state["last_percent"]) < 0.1 and now - progress_state["last_emit"] < 0.8:
+            return
+        progress_state["last_emit"] = now
+        if percent is not None:
+            progress_state["last_percent"] = percent
+
+        evt = {
+            "job_id": job_id,
+            "status": "downloading",
+            "timestamp": _now_iso(),
+            "model_id": model_id,
+            "source": source,
+            "backend_tool": progress_state["backend_tool"],
+            "percent": percent,
+            "speed_bps": speed,
+            "eta_seconds": eta,
+            "downloaded_bytes": downloaded,
+            "total_bytes": total,
+        }
+        latest_state = _read_job_state(job_id) or {}
+        if latest_state.get("cancel_requested"):
+            job_state["cancel_requested"] = True
+        job_state["updated_at"] = evt["timestamp"]
+        job_state["progress"] = {
+            "percent": percent,
+            "speed_bps": speed,
+            "eta_seconds": eta,
+            "downloaded_bytes": downloaded,
+            "total_bytes": total,
+            "backend_tool": progress_state["backend_tool"],
+        }
+        _write_job_state(job_id, job_state)
+        if not options.no_progress:
+            _emit_download_event(json_output, evt)
+
+    try:
+        if source["type"] == "huggingface":
+            result = _download_hf(source["repo_id"], dest, config, options, job_state, on_progress=_on_progress)
+        elif source["type"] == "ollama":
+            result = _download_ollama(source["repo_id"].split("/")[-1], source.get("tag", "latest"), options, job_state, on_progress=_on_progress)
+        elif source["type"] == "url":
+            result = _download_url(source["url"], dest, options, job_state, on_progress=_on_progress)
+        elif source["type"] == "modelscope":
+            result = _download_modelscope(source["repo_id"], dest, options, job_state, on_progress=_on_progress)
+        else:
+            result = DownloadResult(success=False, error_code="INVALID_SOURCE", error_message="Unsupported source")
+    except KeyboardInterrupt:
+        job_state["cancel_requested"] = True
+        _write_job_state(job_id, job_state)
+        result = DownloadResult(
+            success=False,
+            canceled=True,
+            backend_tool=progress_state.get("backend_tool") or "",
+            error_code="CANCELED",
+            error_message="Canceled by user",
+        )
+
+    duration_ms = int((time.time() - start) * 1000)
+
+    if not result.success:
+        status = "canceled" if result.canceled else "failed"
+        error_code = result.error_code
+        exit_code = EXIT_CANCELED if result.canceled else EXIT_FAILED
+        if not error_code:
+            error_code, mapped_exit = _map_download_error(result.error_message)
+            if exit_code != EXIT_CANCELED:
+                exit_code = mapped_exit
+        else:
+            if error_code == "BACKEND_NOT_FOUND":
+                exit_code = EXIT_BACKEND_MISSING
+            elif error_code == "AUTH_FAILED":
+                exit_code = EXIT_AUTH_FAILED
+            elif error_code == "CANCELED":
+                exit_code = EXIT_CANCELED
+        summary = {
+            "job_id": job_id,
+            "status": status,
+            "model_id": model_id,
+            "source": source,
+            "path": str(dest),
+            "final_path": str(dest),
+            "category": final_category,
+            "placement_mode": job_state["placement_mode"],
+            "size_bytes": 0,
+            "duration_ms": duration_ms,
+            "checksum": "",
+            "registered": False,
+            "storage_mode": storage_mode,
+            "backend_tool": result.backend_tool,
+            "backend_command": result.backend_command,
+            "timestamp": _now_iso(),
+            "error": {
+                "code": error_code,
+                "message": result.error_message or "Download failed",
+                "retryable": error_code in {"NETWORK_TIMEOUT", "RATE_LIMITED"},
+                "details": {},
+            },
+        }
+        job_state["status"] = status
+        job_state["updated_at"] = _now_iso()
+        job_state["summary"] = summary
+        _write_job_state(job_id, job_state)
+        _emit_download_summary(json_output, summary)
+        return exit_code
+
+    job_state["status"] = "registering"
+    job_state["updated_at"] = _now_iso()
+    _write_job_state(job_id, job_state)
+    if not options.no_progress:
+        _emit_download_event(json_output, {
+            "job_id": job_id,
+            "status": "registering",
+            "timestamp": _now_iso(),
+            "model_id": model_id,
+            "source": source,
+            "percent": 95,
+            "speed_bps": None,
+            "eta_seconds": 0,
+            "downloaded_bytes": None,
+            "total_bytes": None,
+        })
+
     total_size = 0
     fmt = ""
-    for f in dest.rglob("*"):
-        if f.is_file():
-            total_size += f.stat().st_size
-            if f.suffix == ".safetensors":
-                fmt = "safetensors"
-            elif f.suffix == ".gguf":
-                fmt = fmt or "gguf"
-            elif f.suffix in (".pt", ".pth", ".bin"):
-                fmt = fmt or f.suffix.lstrip(".")
+    if dest.exists():
+        for f in dest.rglob("*"):
+            if f.is_file():
+                total_size += f.stat().st_size
+                if f.suffix == ".safetensors":
+                    fmt = "safetensors"
+                elif f.suffix == ".gguf":
+                    fmt = fmt or "gguf"
+                elif f.suffix in (".pt", ".pth", ".bin"):
+                    fmt = fmt or f.suffix.lstrip(".")
 
+    canonical_rel = ""
+    if storage_mode == "canonical_store":
+        try:
+            canonical_rel = str(dest.relative_to(Path(root.path)))
+        except ValueError:
+            canonical_rel = str(dest)
     entry = ModelEntry(
         id=model_id,
         name=name or model_id,
         source=source,
         format=fmt,
         size_bytes=total_size,
-        category=category,
+        category=final_category,
         tags=[],
-        canonical={"root": root.id, "path": f"{STORE_DIR}/{model_id}"},
-        native_cas=source["type"] in ("ollama", "huggingface") and not dest.exists(),
-        added_at=datetime.now(timezone.utc).isoformat(),
+        canonical={"root": root.id, "path": canonical_rel} if canonical_rel else {"root": root.id, "path": ""},
+        native_cas=(storage_mode == "native_cas"),
+        added_at=_now_iso(),
     )
     registry.add(entry)
     registry.save()
-    print(f"Registered: {model_id} ({format_size(total_size)})")
-    return entry
+
+    final_path = str(dest) if storage_mode == "canonical_store" else str((Path(root.path) / config.get("engines", {}).get("ollama", {}).get("model_dir", "ollama/models")).resolve())
+    summary = {
+        "job_id": job_id,
+        "status": "completed",
+        "model_id": model_id,
+        "source": source,
+        "path": final_path,
+        "final_path": final_path,
+        "category": final_category,
+        "placement_mode": job_state["placement_mode"],
+        "size_bytes": total_size,
+        "duration_ms": duration_ms,
+        "checksum": "",
+        "registered": True,
+        "storage_mode": storage_mode,
+        "backend_tool": result.backend_tool,
+        "backend_command": result.backend_command,
+        "timestamp": _now_iso(),
+    }
+    job_state["status"] = "completed"
+    job_state["updated_at"] = _now_iso()
+    job_state["summary"] = summary
+    _write_job_state(job_id, job_state)
+    if not options.no_progress:
+        _emit_download_event(json_output, {
+            "job_id": job_id,
+            "status": "completed",
+            "timestamp": _now_iso(),
+            "model_id": model_id,
+            "source": source,
+            "percent": 100,
+            "speed_bps": None,
+            "eta_seconds": 0,
+            "downloaded_bytes": total_size if storage_mode == "canonical_store" else None,
+            "total_bytes": total_size if storage_mode == "canonical_store" else None,
+        })
+    _emit_download_summary(json_output, summary)
+    return EXIT_OK
 
 
-def _download_hf(repo_id: str, dest: Path, config: dict) -> bool:
+def _download_hf(repo_id: str, dest: Path, config: dict, options: DownloadOptions, job_state: dict, on_progress: Optional[Any] = None) -> DownloadResult:
     tool = config.get("defaults", {}).get("hf_download_tool", "hfd")
     hfd_path = Path(config.get("roots", [{}])[0].get("path", "")) / "hfd.sh"
+    backend_name = "huggingface-cli"
 
     if tool == "hfd" and hfd_path.exists():
         cmd = ["bash", str(hfd_path), repo_id, "--local-dir", str(dest)]
+        backend_name = "hfd"
     else:
         # fallback to huggingface-cli
         cmd = ["huggingface-cli", "download", repo_id, "--local-dir", str(dest)]
-
-    try:
-        result = subprocess.run(cmd, check=True)
-        return result.returncode == 0
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"  Download error: {e}")
-        return False
-
-
-def _download_ollama(model_name: str, tag: str) -> bool:
-    try:
-        result = subprocess.run(["ollama", "pull", f"{model_name}:{tag}"], check=True)
-        return result.returncode == 0
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"  Download error: {e}")
-        return False
+        backend_name = "huggingface-cli"
+    cmd.extend(options.backend_args or [])
+    env = os.environ.copy()
+    if options.proxy:
+        env["HTTP_PROXY"] = options.proxy
+        env["HTTPS_PROXY"] = options.proxy
+    return _execute_backend_command(
+        cmd=cmd,
+        env=env,
+        options=options,
+        job_state=job_state,
+        backend_tool=backend_name,
+        on_progress=on_progress,
+    )
 
 
-def _download_url(url: str, dest: Path) -> bool:
+def _download_ollama(model_name: str, tag: str, options: DownloadOptions, job_state: dict, on_progress: Optional[Any] = None) -> DownloadResult:
+    cmd = ["ollama", "pull", f"{model_name}:{tag}"]
+    cmd.extend(options.backend_args or [])
+    env = os.environ.copy()
+    if options.proxy:
+        env["HTTP_PROXY"] = options.proxy
+        env["HTTPS_PROXY"] = options.proxy
+    return _execute_backend_command(
+        cmd=cmd,
+        env=env,
+        options=options,
+        job_state=job_state,
+        backend_tool=cmd[0],
+        on_progress=on_progress,
+    )
+
+
+def _download_url(url: str, dest: Path, options: DownloadOptions, job_state: dict, on_progress: Optional[Any] = None) -> DownloadResult:
     filename = url.split("/")[-1].split("?")[0]
     target = dest / filename
+    commands: list[list[str]] = []
+
+    wget_cmd = ["wget", "-O", str(target), url]
+    if options.resume:
+        wget_cmd.insert(1, "-c")
+    curl_cmd = ["curl", "-L", "-o", str(target), url]
+    if options.resume:
+        curl_cmd.insert(1, "-C")
+        curl_cmd.insert(2, "-")
+    if options.proxy:
+        wget_cmd.extend(["-e", f"http_proxy={options.proxy}", "-e", f"https_proxy={options.proxy}"])
+        curl_cmd.extend(["--proxy", options.proxy])
+    if options.timeout:
+        wget_cmd.extend(["--timeout", str(options.timeout)])
+        curl_cmd.extend(["--max-time", str(options.timeout)])
+    if options.connect_timeout:
+        wget_cmd.extend(["--connect-timeout", str(options.connect_timeout)])
+        curl_cmd.extend(["--connect-timeout", str(options.connect_timeout)])
+    if options.retry:
+        wget_cmd.extend(["--tries", str(options.retry)])
+        curl_cmd.extend(["--retry", str(options.retry)])
+    if options.max_speed:
+        wget_cmd.extend(["--limit-rate", options.max_speed])
+        curl_cmd.extend(["--limit-rate", options.max_speed])
+    if not options.verify_ssl:
+        wget_cmd.append("--no-check-certificate")
+        curl_cmd.append("-k")
+    wget_cmd.extend(options.backend_args or [])
+    curl_cmd.extend(options.backend_args or [])
+    commands.extend([wget_cmd, curl_cmd])
+
     try:
-        # prefer wget, fallback to curl
-        for cmd in [
-            ["wget", "-c", "-O", str(target), url],
-            ["curl", "-L", "-o", str(target), url],
-        ]:
-            try:
-                result = subprocess.run(cmd, check=True)
-                return result.returncode == 0
-            except FileNotFoundError:
+        env = os.environ.copy()
+        if options.proxy:
+            env["HTTP_PROXY"] = options.proxy
+            env["HTTPS_PROXY"] = options.proxy
+        last_error = ""
+        last_cmd: list[str] = []
+        all_backend_missing = True
+        url_state = {"known_total": None}
+        for cmd in commands:
+            last_cmd = cmd
+            if not options.resume and target.exists():
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            def _url_progress_adapter(p: dict) -> None:
+                progress = dict(p or {})
+                parsed_total = progress.get("total_bytes")
+                if isinstance(parsed_total, (int, float)) and parsed_total > 0:
+                    if url_state["known_total"] is None:
+                        url_state["known_total"] = int(parsed_total)
+                if url_state["known_total"] is not None:
+                    progress["total_bytes"] = url_state["known_total"]
+                if target.exists():
+                    try:
+                        file_size = target.stat().st_size
+                        progress.setdefault("downloaded_bytes", file_size)
+                    except OSError:
+                        pass
+                pb = progress.get("percent")
+                db = progress.get("downloaded_bytes")
+                if url_state["known_total"] is None and progress.get("total_bytes") is None and isinstance(pb, (int, float)) and pb >= 10 and isinstance(db, (int, float)):
+                    inferred_total = int(float(db) * 100.0 / float(pb))
+                    if inferred_total > 0:
+                        progress["total_bytes"] = inferred_total
+                if on_progress:
+                    on_progress(progress)
+            result = _execute_backend_command(
+                cmd=cmd,
+                env=env,
+                options=options,
+                job_state=job_state,
+                backend_tool=cmd[0],
+                on_progress=_url_progress_adapter,
+            )
+            if result.canceled:
+                return result
+            if result.success:
+                return result
+            if result.error_code == "BACKEND_NOT_FOUND":
                 continue
-        return False
-    except subprocess.CalledProcessError as e:
-        print(f"  Download error: {e}")
-        return False
-
-
-def _download_modelscope(repo_id: str, dest: Path) -> bool:
-    try:
-        result = subprocess.run(
-            ["modelscope", "download", "--model", repo_id, "--local_dir", str(dest)],
-            check=True,
+            all_backend_missing = False
+            last_error = result.error_message or "Download failed"
+        if all_backend_missing:
+            return DownloadResult(
+                success=False,
+                backend_tool=last_cmd[0] if last_cmd else "",
+                backend_command=last_cmd,
+                error_code="BACKEND_NOT_FOUND",
+                error_message="No available URL backend tool (wget/curl)",
+            )
+        return DownloadResult(
+            success=False,
+            backend_tool=last_cmd[0] if last_cmd else "",
+            backend_command=last_cmd,
+            error_message=last_error or "No available URL backend tool (wget/curl)",
         )
-        return result.returncode == 0
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"  Download error: {e}")
-        return False
+    except Exception as e:
+        return DownloadResult(success=False, error_message=str(e))
+
+
+def _download_modelscope(repo_id: str, dest: Path, options: DownloadOptions, job_state: dict, on_progress: Optional[Any] = None) -> DownloadResult:
+    cmd = ["modelscope", "download", "--model", repo_id, "--local_dir", str(dest)]
+    if options.timeout:
+        cmd.extend(["--timeout", str(options.timeout)])
+    cmd.extend(options.backend_args or [])
+    env = os.environ.copy()
+    if options.proxy:
+        env["HTTP_PROXY"] = options.proxy
+        env["HTTPS_PROXY"] = options.proxy
+    return _execute_backend_command(
+        cmd=cmd,
+        env=env,
+        options=options,
+        job_state=job_state,
+        backend_tool=cmd[0],
+        on_progress=on_progress,
+    )
 
 
 def op_provision(config: dict, registry: Registry, model_id: str,
@@ -2029,9 +3067,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     # download
     p = sub.add_parser("download", help="Download a model")
-    p.add_argument("source", type=str, help="Source: hf:org/repo | ollama:model:tag | url:https://... | ms:org/repo")
+    p.add_argument("source", nargs="?", type=str, help="Source: hf:org/repo | ollama:model:tag | url:https://... | ms:org/repo | status | cancel")
+    p.add_argument("job_id", nargs="?", type=str, help="Job ID for 'download status/cancel'")
     p.add_argument("--name", type=str, default="", help="Custom model ID")
     p.add_argument("--category", type=str, default="", help="Model category")
+    p.add_argument("--path", type=str, default="", help="Explicit destination path")
+    p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
+    p.add_argument("--proxy", type=str, default=None, help="Proxy URL (http/https/socks5)")
+    p.add_argument("--timeout", type=int, default=None, help="Transfer timeout in seconds")
+    p.add_argument("--connect-timeout", type=int, default=None, dest="connect_timeout", help="Connect timeout in seconds")
+    p.add_argument("--retry", type=int, default=None, help="Retry attempts")
+    p.add_argument("--retry-backoff", type=float, default=None, dest="retry_backoff", help="Retry backoff multiplier")
+    p.add_argument("--max-speed", type=str, default=None, dest="max_speed", help="Max transfer speed (e.g. 5M)")
+    p.add_argument("--concurrency", type=int, default=None, help="Backend concurrency hint")
+    p.add_argument("--no-verify-ssl", action="store_true", dest="no_verify_ssl", help="Disable TLS certificate verification")
+    p.add_argument("--no-progress", action="store_true", dest="no_progress", help="Suppress progress events; print summary only")
+    p.add_argument("--backend-arg", action="append", dest="backend_args", default=[], help="Pass-through arg to backend tool")
+    p.add_argument("--resume", dest="resume", action="store_true", default=True, help="Resume partial download when supported (default)")
+    p.add_argument("--no-resume", dest="resume", action="store_false", help="Disable resume behavior")
+    p.add_argument("--force-redownload", action="store_true", dest="force_redownload", help="Redownload even if model already exists")
 
     # provision
     p = sub.add_parser("provision", help="Create engine links for a model")
@@ -2096,13 +3150,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
-        return
+        return EXIT_OK
 
     # Determine root path
     root_path = Path(args.root).expanduser().resolve() if args.root else Path.home() / "AI"
@@ -2181,7 +3235,31 @@ def main() -> None:
             print(resolved)
 
     elif cmd == "download":
-        op_download(config, registry, args.source, name=args.name, category=args.category)
+        if args.source == "status":
+            if not args.job_id:
+                print("Usage: aim download status <job_id>", file=sys.stderr)
+                return EXIT_INVALID_ARGS
+            return op_download_status(args.job_id, json_output=args.json_output)
+        if args.source == "cancel":
+            if not args.job_id:
+                print("Usage: aim download cancel <job_id>", file=sys.stderr)
+                return EXIT_INVALID_ARGS
+            return op_download_cancel(args.job_id, json_output=args.json_output)
+        if not args.source:
+            print("Usage: aim download <source> [options]", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        options = _build_download_options(config, args)
+        return op_download(
+            config,
+            registry,
+            args.source,
+            name=args.name,
+            category=args.category,
+            path=args.path,
+            json_output=args.json_output,
+            options=options,
+            force_redownload=args.force_redownload,
+        )
 
     elif cmd == "provision":
         print(f"Provisioning {args.model_id} for {args.engine}...")
@@ -2255,7 +3333,10 @@ def main() -> None:
 
     else:
         parser.print_help()
+        return EXIT_OK
+
+    return EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
