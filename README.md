@@ -64,6 +64,12 @@ aim download url:https://example.com/model.bin --no-progress
 aim download url:https://example.com/model.bin --no-resume
 aim download hf:org/repo --proxy http://127.0.0.1:7890 --retry 3 --retry-backoff 1.5
 
+# Import/register existing local model path
+aim import /path/to/local/model-dir --id my-model --category llm/chat
+
+# Convert native CAS model to managed store model
+aim convert hf-org-repo --new-id hf-org-repo-managed --category llm/chat
+
 # Provision a model for an engine
 aim provision <model_id> --engine comfyui
 

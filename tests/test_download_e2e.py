@@ -266,6 +266,74 @@ exit 0
         state = json.loads(st.stdout.strip())
         self.assertEqual(state["status"], "canceled")
 
+    def test_import_register_local_path(self) -> None:
+        model_dir = self.home / "models" / "local-m1"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "weights.safetensors").write_bytes(b"x" * 1024)
+        p = self._run(
+            "import",
+            str(model_dir),
+            "--id",
+            "local-m1",
+            "--category",
+            "llm/chat",
+            "--json",
+        )
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = json.loads(p.stdout.strip())
+        self.assertEqual(out["status"], "imported")
+        self.assertEqual(out["model_id"], "local-m1")
+
+        registry_path = self.home / ".aim" / "registry.json"
+        self.assertTrue(registry_path.exists())
+        registry = json.loads(registry_path.read_text())
+        ids = {m["id"] for m in registry.get("models", [])}
+        self.assertIn("local-m1", ids)
+
+    def test_convert_native_to_managed_store(self) -> None:
+        src_dir = self.home / "native-cas" / "hf-model"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / "model.bin").write_bytes(b"z" * 2048)
+
+        imp = self._run(
+            "import",
+            str(src_dir),
+            "--id",
+            "hf-native-demo",
+            "--category",
+            "asr/model",
+            "--source-type",
+            "huggingface",
+            "--repo-id",
+            "org/repo",
+            "--native-cas",
+            "--json",
+        )
+        self.assertEqual(imp.returncode, 0, imp.stderr)
+
+        conv = self._run(
+            "convert",
+            "hf-native-demo",
+            "--new-id",
+            "hf-native-demo-managed",
+            "--category",
+            "asr/model",
+            "--json",
+        )
+        self.assertEqual(conv.returncode, 0, conv.stderr)
+        out = json.loads(conv.stdout.strip())
+        self.assertEqual(out["status"], "converted")
+        dst = Path(out["path"])
+        self.assertTrue(dst.exists())
+        self.assertTrue((dst / "model.bin").exists())
+
+        registry = json.loads((self.home / ".aim" / "registry.json").read_text())
+        by_id = {m["id"]: m for m in registry.get("models", [])}
+        self.assertIn("hf-native-demo", by_id)
+        self.assertIn("hf-native-demo-managed", by_id)
+        self.assertTrue(by_id["hf-native-demo"]["native_cas"])
+        self.assertFalse(by_id["hf-native-demo-managed"]["native_cas"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -65,7 +65,11 @@ class StorageRoot:
 
     @property
     def store_path(self) -> Path:
-        return Path(self.path) / STORE_DIR
+        p = Path(self.path)
+        # Allow users to pass either "/.../AI" or "/.../AI/store" as root path.
+        if p.name == STORE_DIR:
+            return p
+        return p / STORE_DIR
 
 
 @dataclass
@@ -2404,6 +2408,210 @@ def op_migrate(config: dict, registry: Registry, model_id: str, to_root_id: str)
     return True
 
 
+def op_import(
+    config: dict,
+    registry: Registry,
+    local_path: str,
+    model_id: str,
+    category: str = "",
+    name: str = "",
+    source_type: str = "local",
+    repo_id: str = "",
+    url: str = "",
+    native_cas: bool = False,
+    json_output: bool = False,
+) -> bool:
+    """Import/register an existing local file or directory as a model entry."""
+    p = Path(local_path).expanduser().resolve()
+    if not p.exists():
+        msg = f"Local path does not exist: {p}"
+        if json_output:
+            print(json.dumps({"error": {"code": "PATH_NOT_FOUND", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+        return False
+
+    mid = _sanitize_model_id(model_id or p.name)
+    if not mid:
+        msg = "Invalid model id."
+        if json_output:
+            print(json.dumps({"error": {"code": "INVALID_MODEL_ID", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+        return False
+
+    root = get_primary_root(config)
+    total_size, fmt = _compute_path_stats(p)
+    if not category:
+        category = "uncategorized"
+
+    try:
+        canonical_path = str(p.relative_to(Path(root.path)))
+    except ValueError:
+        canonical_path = str(p)
+
+    src: dict[str, str] = {"type": source_type}
+    if repo_id:
+        src["repo_id"] = repo_id
+    if url:
+        src["url"] = url
+    if not repo_id and source_type == "local":
+        src["repo_id"] = p.name
+
+    entry = ModelEntry(
+        id=mid,
+        name=name or mid,
+        source=src,
+        format=fmt,
+        size_bytes=total_size,
+        category=category,
+        tags=[],
+        canonical={"root": root.id, "path": canonical_path},
+        native_cas=native_cas,
+        engines=[],
+        provisions=[],
+        added_at=datetime.now(timezone.utc).isoformat(),
+    )
+    registry.add(entry)
+    registry.save()
+
+    out = {
+        "status": "imported",
+        "model_id": mid,
+        "path": str(p),
+        "category": category,
+        "size_bytes": total_size,
+        "format": fmt,
+        "native_cas": native_cas,
+    }
+    if json_output:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Imported: {mid} ({format_size(total_size)})")
+        print(f"Path: {p}")
+    return True
+
+
+def op_convert_native_to_store(
+    config: dict,
+    registry: Registry,
+    model_id: str,
+    new_id: str = "",
+    category: str = "",
+    mode: str = "copy",
+    keep_native: bool = True,
+    json_output: bool = False,
+) -> bool:
+    """Convert native CAS model into managed store model."""
+    entry = registry.find(model_id)
+    if not entry:
+        msg = f"Model '{model_id}' not found."
+        if json_output:
+            print(json.dumps({"error": {"code": "MODEL_NOT_FOUND", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+        return False
+    if not entry.native_cas:
+        msg = f"Model '{model_id}' is already managed (native_cas=false)."
+        if json_output:
+            print(json.dumps({"error": {"code": "NOT_NATIVE_CAS", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+        return False
+
+    roots = {r.id: r for r in get_roots(config)}
+    src_root = roots.get(entry.canonical.get("root", "primary")) or get_primary_root(config)
+    src_rel = entry.canonical.get("path", "")
+    src_path = Path(src_rel)
+    if not src_path.is_absolute():
+        src_path = Path(src_root.path) / src_rel
+    src_path = src_path.resolve()
+    if not src_path.exists():
+        msg = f"Source path does not exist: {src_path}"
+        if json_output:
+            print(json.dumps({"error": {"code": "SOURCE_PATH_NOT_FOUND", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+        return False
+
+    dst_root = get_primary_root(config)
+    target_id = _sanitize_model_id(new_id or entry.id)
+    target_category = category or entry.category or _infer_download_category(entry.source, target_id, explicit_category="")
+    dst_path = (dst_root.store_path / target_category / target_id).resolve()
+
+    if dst_path.exists():
+        msg = f"Destination already exists: {dst_path}"
+        if json_output:
+            print(json.dumps({"error": {"code": "DEST_EXISTS", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+        return False
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if mode == "move" and not keep_native:
+            shutil.move(str(src_path), str(dst_path))
+        else:
+            if src_path.is_dir():
+                shutil.copytree(src_path, dst_path)
+            else:
+                shutil.copy2(src_path, dst_path)
+        if mode == "copy" and not keep_native:
+            if src_path.is_dir():
+                shutil.rmtree(src_path)
+            else:
+                src_path.unlink(missing_ok=True)
+    except OSError as e:
+        msg = f"Conversion failed: {e}"
+        if json_output:
+            print(json.dumps({"error": {"code": "CONVERT_FAILED", "message": msg, "retryable": False}}, ensure_ascii=False))
+        else:
+            print(f"Error: {msg}")
+        return False
+
+    size_bytes, fmt = _compute_path_stats(dst_path)
+    managed_entry = copy.deepcopy(entry)
+    managed_entry.id = target_id
+    managed_entry.name = managed_entry.name or target_id
+    managed_entry.category = target_category
+    managed_entry.format = fmt or managed_entry.format
+    managed_entry.size_bytes = size_bytes
+    managed_entry.native_cas = False
+    try:
+        canonical_path = str(dst_path.relative_to(Path(dst_root.path).resolve()))
+    except ValueError:
+        canonical_path = str(dst_path)
+    managed_entry.canonical = {
+        "root": dst_root.id,
+        "path": canonical_path,
+    }
+    managed_entry.provisions = []
+    managed_entry.added_at = datetime.now(timezone.utc).isoformat()
+    managed_entry.source = copy.deepcopy(entry.source) if entry.source else {"type": "local", "repo_id": target_id}
+
+    registry.add(managed_entry)
+    if target_id != entry.id and not keep_native:
+        registry.remove(entry.id)
+    registry.save()
+
+    out = {
+        "status": "converted",
+        "from_model_id": model_id,
+        "model_id": target_id,
+        "path": str(dst_path),
+        "category": target_category,
+        "size_bytes": size_bytes,
+        "mode": mode,
+        "keep_native": keep_native,
+    }
+    if json_output:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Converted: {model_id} -> {target_id}")
+        print(f"Path: {dst_path}")
+    return True
+
+
 def op_dedup(config: dict, registry: Registry, scan_only: bool = True) -> list[dict]:
     """Find duplicate model files by content hash."""
     root = get_primary_root(config)
@@ -2851,8 +3059,8 @@ def op_root_add(config: dict, path: str, label: str = "") -> None:
     new_root = {"id": rid, "path": str(root_path), "label": label or str(root_path), "priority": len(existing_ids) + 1}
     config.setdefault("roots", []).append(new_root)
 
-    # Create store in new root
-    (root_path / STORE_DIR).mkdir(exist_ok=True)
+    # Create store in new root (supports both "/.../AI" and "/.../AI/store")
+    StorageRoot(id=rid, path=str(root_path)).store_path.mkdir(parents=True, exist_ok=True)
 
     save_config(config)
     print(f"Added root: {rid} → {root_path}")
@@ -2915,6 +3123,34 @@ def _resolve_weight_file(model_dir: Path, fmt: str) -> Optional[str]:
 
     # Pick the largest weight file
     return str(max(weights, key=lambda f: f.stat().st_size).resolve())
+
+
+def _compute_path_stats(path: Path) -> tuple[int, str]:
+    """Compute total size and infer model format for a file/dir."""
+    total_size = 0
+    fmt = ""
+    files: list[Path] = []
+    if path.is_file():
+        files = [path]
+    elif path.is_dir():
+        files = [p for p in path.rglob("*") if p.is_file()]
+    for f in files:
+        try:
+            total_size += f.stat().st_size
+        except OSError:
+            continue
+        s = f.suffix.lower()
+        if s == ".safetensors":
+            fmt = "safetensors"
+        elif s == ".gguf":
+            fmt = fmt or "gguf"
+        elif s in (".pt", ".pth", ".bin", ".onnx", ".ckpt"):
+            fmt = fmt or s.lstrip(".")
+    return total_size, fmt
+
+
+def _sanitize_model_id(model_id: str) -> str:
+    return re.sub(r"[^a-z0-9._-]", "-", model_id.lower()).strip("-")
 
 
 # ── Display / Formatting ────────────────────────────────────────────────────
@@ -3123,6 +3359,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", type=str, required=True, dest="to_root", help="Target root ID")
     p.add_argument("--category", type=str, default="", help="Migrate all models in category")
 
+    # import
+    p = sub.add_parser("import", help="Import/register an existing local model path")
+    p.add_argument("local_path", type=str, help="Local file or directory path")
+    p.add_argument("--id", type=str, default="", dest="model_id", help="Model ID")
+    p.add_argument("--name", type=str, default="", help="Model display name")
+    p.add_argument("--category", type=str, default="", help="Model category")
+    p.add_argument("--source-type", type=str, default="local", choices=["local", "huggingface", "url", "modelscope", "ollama"], help="Source type metadata")
+    p.add_argument("--repo-id", type=str, default="", help="Optional source repo ID")
+    p.add_argument("--url", type=str, default="", help="Optional source URL")
+    p.add_argument("--native-cas", action="store_true", dest="native_cas", help="Mark imported model as native CAS")
+    p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
+
+    # convert
+    p = sub.add_parser("convert", help="Convert native CAS model into managed store model")
+    p.add_argument("model_id", type=str, help="Existing native CAS model ID")
+    p.add_argument("--new-id", type=str, default="", dest="new_id", help="Target managed model ID (default: same as model_id)")
+    p.add_argument("--category", type=str, default="", help="Target category (default: keep existing)")
+    p.add_argument("--mode", choices=["copy", "move"], default="copy", help="Data migration mode")
+    p.add_argument("--keep-native", action="store_true", dest="keep_native", default=True, help="Keep native source files (default)")
+    p.add_argument("--no-keep-native", action="store_false", dest="keep_native", help="Remove native source files after convert")
+    p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
+
     # dedup
     p = sub.add_parser("dedup", help="Find/fix duplicate files")
     p.add_argument("--scan", action="store_true", dest="dedup_scan", help="Scan only")
@@ -3310,6 +3568,37 @@ def main() -> int:
         else:
             print("Usage: aim migrate MODEL_ID --to ROOT_ID")
             print("       aim migrate --category CAT --to ROOT_ID")
+
+    elif cmd == "import":
+        if not args.model_id:
+            args.model_id = Path(args.local_path).name
+        ok = op_import(
+            config,
+            registry,
+            local_path=args.local_path,
+            model_id=args.model_id,
+            category=args.category,
+            name=args.name,
+            source_type=args.source_type,
+            repo_id=args.repo_id,
+            url=args.url,
+            native_cas=args.native_cas,
+            json_output=args.json_output,
+        )
+        return EXIT_OK if ok else EXIT_FAILED
+
+    elif cmd == "convert":
+        ok = op_convert_native_to_store(
+            config,
+            registry,
+            model_id=args.model_id,
+            new_id=args.new_id,
+            category=args.category,
+            mode=args.mode,
+            keep_native=args.keep_native,
+            json_output=args.json_output,
+        )
+        return EXIT_OK if ok else EXIT_FAILED
 
     elif cmd == "dedup":
         op_dedup(config, registry, scan_only=not args.dedup_apply)

@@ -35,6 +35,20 @@ class DownloadCoreTests(unittest.TestCase):
         self.assertEqual(mode, "explicit")
         self.assertTrue(str(dest).endswith("custom/model"))
 
+    def test_store_path_normalization_base_root(self):
+        root = aim.StorageRoot(id="r1", path="/tmp/ai")
+        self.assertEqual(root.store_path, Path("/tmp/ai/store"))
+
+    def test_store_path_normalization_store_root(self):
+        root = aim.StorageRoot(id="r2", path="/tmp/ai/store")
+        self.assertEqual(root.store_path, Path("/tmp/ai/store"))
+
+    def test_resolve_download_dest_when_root_already_store(self):
+        root = aim.StorageRoot(id="primary", path="/tmp/ai/store")
+        dest, mode = aim._resolve_download_dest(root, "m2", "llm/chat", "")
+        self.assertEqual(mode, "auto")
+        self.assertEqual(dest, Path("/tmp/ai/store/llm/chat/m2"))
+
 
 if __name__ == "__main__":
     unittest.main()
