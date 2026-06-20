@@ -100,6 +100,11 @@ class ModelEntry:
     native_cas: bool = False
     engines: list[str] = field(default_factory=list)
     provisions: list[dict] = field(default_factory=list)
+    # External (out-of-root) dependencies on this model: programs/symlinks that aim
+    # does NOT create itself. Each: {"path": str, "consumer": str, "link_type":
+    # "symlink"|"hardlink"|"reference"}. Surfaced by info/verify, warned on delete,
+    # re-pointed on migrate. Registered via `aim link` (manually or --scan).
+    external_links: list[dict] = field(default_factory=list)
     added_at: str = ""
 
     def to_dict(self) -> dict:
@@ -2304,6 +2309,115 @@ def op_unprovision(config: dict, registry: Registry, model_id: str, engine: str)
     return bool(removed)
 
 
+def _canonical_abs(root, entry) -> Path:
+    return Path(root.path) / entry.canonical.get("path", "")
+
+
+def op_link(config: dict, registry: Registry, model_id: str, external_path: str,
+            consumer: str = "", link_type: str = "symlink", create: bool = False) -> bool:
+    """Register an EXTERNAL (out-of-root) dependency on a model.
+
+    Records {path, consumer, link_type} in the model's ``external_links`` so aim can
+    surface it (info/verify), warn before delete, and re-point it on migrate. With
+    ``create``, also creates the symlink ``external_path`` → the model's store path
+    (use for a fresh consumer); otherwise it just records an already-existing path.
+    """
+    entry = registry.find(model_id)
+    if not entry:
+        print(f"Error: Model '{model_id}' not found.")
+        return False
+    ext = str(Path(external_path).expanduser())  # keep as-given; don't resolve the symlink away
+    if create:
+        if link_type == "reference":
+            print("Error: --create needs --type symlink|hardlink (reference records a path only).")
+            return False
+        canonical = _canonical_abs(get_primary_root(config), entry)
+        if not canonical.exists():
+            print(f"Error: canonical path missing (run scan?): {canonical}")
+            return False
+        LinkManager.create_link(canonical, Path(ext), link_type)
+        print(f"  created {link_type}: {ext} -> {canonical}")
+    rec = {"path": ext, "consumer": consumer or "unknown", "link_type": link_type}
+    entry.external_links = [e for e in entry.external_links if e.get("path") != ext]
+    entry.external_links.append(rec)
+    registry.save()
+    print(f"Linked: {model_id} ← {ext}" + (f"  ({consumer})" if consumer else ""))
+    return True
+
+
+def op_unlink(config: dict, registry: Registry, model_id: str, external_path: str,
+              remove: bool = False) -> bool:
+    """Remove a registered external dependency; with ``remove`` also delete the symlink."""
+    entry = registry.find(model_id)
+    if not entry:
+        print(f"Error: Model '{model_id}' not found.")
+        return False
+    ext = str(Path(external_path).expanduser())
+    kept = [e for e in entry.external_links if e.get("path") != ext]
+    if len(kept) == len(entry.external_links):
+        print(f"No external link recorded at {ext} for {model_id}.")
+        return False
+    entry.external_links = kept
+    if remove:
+        try:
+            LinkManager.remove_link(Path(ext))
+            print(f"  removed link: {ext}")
+        except OSError as exc:
+            print(f"  (could not remove {ext}: {exc})")
+    registry.save()
+    print(f"Unlinked: {model_id} ✗ {ext}")
+    return True
+
+
+def op_link_scan(config: dict, registry: Registry, scan_roots: list[str],
+                 consumer: str = "", apply: bool = False) -> bool:
+    """Auto-discover external symlinks (under scan_roots) that resolve INTO the aim
+    root and register each against the model it points at. Dry-run unless ``apply``."""
+    root = get_primary_root(config)
+    ai = str(Path(root.path).resolve())
+    canon = {str(_canonical_abs(root, m).resolve()): m.id for m in registry.models}
+    found = registered = 0
+    for raw in scan_roots:
+        r = Path(raw).expanduser()
+        if not r.exists():
+            continue
+        base = str(r).count(os.sep)
+        for dirpath, dirs, files in os.walk(r):  # followlinks=False
+            if dirpath.count(os.sep) - base > 6:
+                dirs[:] = []
+                continue
+            for name in list(dirs) + files:
+                p = os.path.join(dirpath, name)
+                if not os.path.islink(p):
+                    continue
+                try:
+                    real = os.path.realpath(p)
+                except OSError:
+                    continue
+                if real != ai and not real.startswith(ai + os.sep):
+                    continue
+                found += 1
+                mid = canon.get(real)
+                if not mid:
+                    for cp, cid in canon.items():
+                        if real == cp or real.startswith(cp + os.sep):
+                            mid = cid
+                            break
+                print(f"  {p}\n    -> {real}  [{mid or '(no matching model — engine-level link)'}]")
+                if apply and mid:
+                    entry = registry.find(mid)
+                    if entry and not any(e.get("path") == p for e in entry.external_links):
+                        entry.external_links.append(
+                            {"path": p, "consumer": consumer or "auto-scan", "link_type": "symlink"})
+                        registered += 1
+    if apply:
+        registry.save()
+        print(f"\nFound {found} external symlink(s) into the aim root; registered {registered}.")
+    else:
+        print(f"\nFound {found} external symlink(s). Re-run with --apply to register them.")
+    return True
+
+
 def op_delete(config: dict, registry: Registry, model_id: str, force: bool = False) -> bool:
     """Delete a model and all its provisions."""
     entry = registry.find(model_id)
@@ -2317,6 +2431,12 @@ def op_delete(config: dict, registry: Registry, model_id: str, force: bool = Fal
         return False
 
     root = get_primary_root(config)
+
+    if entry.external_links:
+        print(f"⚠ '{model_id}' has {len(entry.external_links)} external dependency(ies) that "
+              f"will DANGLE after delete (aim cannot fix these):")
+        for e in entry.external_links:
+            print(f"    {e.get('path')}  ({e.get('consumer', '?')})")
 
     # Remove all provisions
     for p in entry.provisions:
@@ -2396,6 +2516,22 @@ def op_migrate(config: dict, registry: Registry, model_id: str, to_root_id: str)
             new_provisions.extend([asdict(np) for np in new_provs])
 
     entry.provisions = new_provisions
+
+    # Re-point external symlinks (registered via `aim link`) to the new location,
+    # so out-of-root consumers keep working after migration. Reference/hardlink
+    # deps can't be auto-fixed — warn for those.
+    for e in entry.external_links:
+        extp = Path(e.get("path", ""))
+        if e.get("link_type") == "symlink":
+            try:
+                if extp.is_symlink() or extp.exists():
+                    LinkManager.remove_link(extp)
+                LinkManager.create_link(dst_path, extp, "symlink")
+                print(f"  re-pointed external: {extp} -> {dst_path}")
+            except OSError as exc:
+                print(f"  ⚠ could not re-point {extp}: {exc}")
+        else:
+            print(f"  ⚠ external {e.get('link_type')} dep not auto-fixed: {extp} ({e.get('consumer','?')})")
 
     # Remove source
     if src_path.is_dir():
@@ -2757,6 +2893,24 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
                 if not target.exists():
                     issues.append({"model": model.id, "provision": p,
                                    "ok": False, "error": "missing", "target": str(target)})
+
+    # External (out-of-root) deps registered via `aim link` — checked for all
+    # models (incl. native-CAS, which the loop above skips).
+    for model in registry.models:
+        if not model.external_links:
+            continue
+        canonical = _canonical_abs(get_primary_root(config), model).resolve()
+        for e in model.external_links:
+            ext = Path(e.get("path", ""))
+            if not ext.exists() and not ext.is_symlink():
+                issues.append({"model": model.id, "external_link": e, "ok": False,
+                               "error": "external_missing", "path": str(ext)})
+            elif ext.is_symlink():
+                real = Path(os.path.realpath(ext))
+                if real != canonical and not str(real).startswith(str(canonical) + os.sep):
+                    issues.append({"model": model.id, "external_link": e, "ok": False,
+                                   "error": "external_wrong_target", "path": str(ext),
+                                   "actual": str(real), "expected_under": str(canonical)})
 
     if not issues:
         print("All links verified OK.")
@@ -3205,6 +3359,11 @@ def display_model_info(model: ModelEntry, show_provisions: bool = False) -> None
         for p in model.provisions:
             print(f"  [{p.get('link_type', '?')}] {p.get('engine', '?')}: {p.get('target', '?')}")
 
+    if model.external_links:
+        print(f"\nExternal links ({len(model.external_links)}) — out-of-root consumers:")
+        for e in model.external_links:
+            print(f"  [{e.get('link_type', '?')}] {e.get('consumer', '?')}: {e.get('path', '?')}")
+
 
 def display_status(config: dict, registry: Registry, group_by: str = "engine") -> None:
     models = registry.models
@@ -3333,6 +3492,30 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("unprovision", help="Remove engine links for a model")
     p.add_argument("model_id", type=str)
     p.add_argument("--engine", type=str, required=True, help="Target engine")
+
+    # link / unlink — external (out-of-root) dependencies on a model
+    p = sub.add_parser("link", help="Register an external app/symlink dependency on a model")
+    p.add_argument("model_id", nargs="?", default="", type=str, help="Model id (omit with --scan)")
+    p.add_argument("external_path", nargs="?", default="", type=str,
+                   help="External path/symlink that depends on the model")
+    p.add_argument("--consumer", type=str, default="", help="Consuming app/service name")
+    p.add_argument("--type", dest="link_type", default="symlink",
+                   choices=["symlink", "hardlink", "reference"],
+                   help="Link type (reference = recorded dep, no actual link)")
+    p.add_argument("--create", action="store_true",
+                   help="Also create the symlink (external_path -> the model's store path)")
+    p.add_argument("--scan", action="store_true",
+                   help="Auto-discover external symlinks into the aim root and register them")
+    p.add_argument("--scan-roots", type=str, default="~/.cache,~/Library/Caches",
+                   help="Comma-separated roots to scan (with --scan)")
+    p.add_argument("--apply", action="store_true",
+                   help="With --scan: actually register (default: dry-run preview)")
+    p.add_argument("--json", action="store_true", dest="json_output")
+
+    p = sub.add_parser("unlink", help="Remove a registered external dependency")
+    p.add_argument("model_id", type=str)
+    p.add_argument("external_path", type=str)
+    p.add_argument("--remove", action="store_true", help="Also delete the symlink at external_path")
 
     # update
     p = sub.add_parser("update", help="Check/execute model updates")
@@ -3526,6 +3709,21 @@ def main() -> int:
     elif cmd == "unprovision":
         print(f"Unprovisioning {args.model_id} from {args.engine}...")
         op_unprovision(config, registry, args.model_id, args.engine)
+
+    elif cmd == "link":
+        if args.scan:
+            roots = [s for s in args.scan_roots.split(",") if s.strip()]
+            op_link_scan(config, registry, roots, consumer=args.consumer, apply=args.apply)
+        elif args.model_id and args.external_path:
+            op_link(config, registry, args.model_id, args.external_path,
+                    consumer=args.consumer, link_type=args.link_type, create=args.create)
+        else:
+            print("Usage: aim link <model_id> <external_path> [--consumer N] [--create]")
+            print("       aim link --scan [--apply]   (auto-discover external symlinks)")
+            return EXIT_INVALID_ARGS
+
+    elif cmd == "unlink":
+        op_unlink(config, registry, args.model_id, args.external_path, remove=args.remove)
 
     elif cmd == "update":
         mid = args.model_id

@@ -51,6 +51,8 @@ aim status          存储概览
 aim download        下载模型
 aim provision       为引擎创建链接
 aim unprovision     移除引擎链接
+aim link            登记外部应用/软链对模型的依赖(可 --scan 自动发现)
+aim unlink          移除外部依赖登记
 aim update          检查/执行更新
 aim delete          删除模型
 
@@ -187,6 +189,34 @@ aim unprovision qwen3.5-27b-8bit --engine omlx
 ```
 
 仅移除链接，不删除 store 中的模型文件。
+
+---
+
+### aim link / unlink — 登记外部依赖
+
+`provision` 记录的是 **aim 自己**为 9 个引擎建的链接（都在根内）。但根**外**的应用常通过手动软链消费 store 里的模型（如 `~/.cache/dolphin → store`、`~/.cache/huggingface → ~/AI/huggingface`）——aim 原本对此一无所知，`migrate`/`delete` 会悄悄弄断它们。`aim link` 把这些外部依赖登记进模型的 `external_links`，于是 `info` 能看到、`verify` 会校验、`delete` 会警告、`migrate` 会**自动重指**外部软链到新位置。
+
+```bash
+# 登记一个已存在的外部软链/路径对模型的依赖
+aim link ms-dataoceanai-dolphin-small ~/.cache/dolphin/small --consumer "OpenSpeechAPI dolphin"
+
+# 登记并顺便创建软链(external_path → 模型 store 路径)
+aim link <model_id> ~/.cache/foo/bar --consumer myapp --create
+
+# 只记录依赖、不建实际链接(程序按路径/配置加载)
+aim link <model_id> /opt/app/models/x --type reference --consumer myapp
+
+# 自动发现:扫描缓存目录里指向 aim 根的软链并批量登记
+aim link --scan                 # 预览(dry-run)
+aim link --scan --apply         # 实际登记
+aim link --scan --scan-roots ~/.cache,~/Library/Caches --apply
+
+# 移除登记(加 --remove 连软链一起删)
+aim unlink <model_id> ~/.cache/foo/bar
+aim unlink <model_id> ~/.cache/foo/bar --remove
+```
+
+**参数：** `--consumer` 消费方名称；`--type symlink|hardlink|reference`；`--create` 顺便建链；`--scan [--apply] [--scan-roots ...]` 自动发现登记。
 
 ---
 
