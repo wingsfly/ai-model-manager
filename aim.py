@@ -3944,6 +3944,25 @@ def _ingest_to_store(files: list, dest: Path) -> int:
     return total
 
 
+def _hf_build_shim(repo_dir: Path, store_dir: Path, commit: str, files: list) -> None:
+    """Rebuild a HF cache repo as a shim: snapshots/<commit>/<file> -> absolute symlink into store."""
+    blobs = repo_dir / "blobs"
+    if blobs.exists():
+        shutil.rmtree(blobs)
+    (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "refs" / "main").write_text(commit)
+    snap = repo_dir / "snapshots" / commit
+    if snap.exists():
+        shutil.rmtree(snap)
+    snap.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        target = snap / f["name"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        os.symlink((store_dir / f["name"]).resolve(), target)
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}

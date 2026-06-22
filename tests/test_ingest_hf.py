@@ -75,5 +75,24 @@ class IngestToStoreTests(unittest.TestCase):
         self.assertTrue((dest / "sub" / "f.bin").exists())
 
 
+class HFBuildShimTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+
+    def test_shim_snapshots_symlink_into_store(self):
+        store = self.home / "store" / "asr" / "model" / "m1"
+        _write(store / "config.json", b'{"a":1}')
+        _write(store / "model.safetensors", b"WEIGHTS")
+        repo_dir = self.home / "hub" / "models--Org--Model"
+        files = [{"name": "config.json"}, {"name": "model.safetensors"}]
+        aim._hf_build_shim(repo_dir, store, commit="abc123", files=files)
+        self.assertEqual((repo_dir / "refs" / "main").read_text(), "abc123")
+        link = repo_dir / "snapshots" / "abc123" / "model.safetensors"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), (store / "model.safetensors").resolve())
+        self.assertEqual(link.read_bytes(), b"WEIGHTS")
+        self.assertFalse((repo_dir / "blobs").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
