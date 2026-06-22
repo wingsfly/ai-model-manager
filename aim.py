@@ -3532,6 +3532,19 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
                                    "error": "external_wrong_target", "path": str(ext),
                                    "actual": str(real), "expected_under": str(canonical)})
 
+    # SP2: verify storage shims resolve; rebuild from annotation with --fix.
+    for m in registry.models:
+        st = getattr(m, "storage", {}) or {}
+        if not st.get("shims"):
+            continue
+        for shim in st["shims"]:
+            loc = shim["location"]
+            cache_path = Path(loc) if os.path.isabs(loc) else (Path(get_primary_root(config).path) / loc)
+            if not (cache_path.exists() or cache_path.is_symlink()):
+                issues.append({"model": m.id, "error": "shim_missing", "path": str(cache_path)})
+                if fix and _rebuild_shim_from_storage(config, m):
+                    print(f"  Fixed shim for {m.id}")
+
     if not issues:
         print("All links verified OK.")
         return []
@@ -4024,6 +4037,36 @@ def _sanitize_ingest_id(entry: "ModelEntry", new_id: str) -> str:
     return _sanitize_model_id(new_id) if new_id else entry.id
 
 
+def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
+    """Rebuild a model's load shim(s) from its storage annotation. Returns True if rebuilt."""
+    storage = entry.storage or {}
+    if not storage.get("shims"):
+        return False
+    root = get_primary_root(config)
+    store_dir = Path(root.path) / storage.get("store_path", "")
+    rebuilt = False
+    for shim in storage["shims"]:
+        loc = shim["location"]
+        cache_path = Path(loc) if os.path.isabs(loc) else (Path(root.path) / loc)
+        rc = shim.get("reconstruct", {})
+        if shim["kind"] == "hf-cas":
+            files = [{"name": n} for n in rc.get("files", [])]
+            _hf_build_shim(cache_path, store_dir, rc.get("commit", ""), files)
+            rebuilt = True
+        elif shim["kind"] == "ms-dir":
+            _ms_build_shim(cache_path, store_dir)
+            rebuilt = True
+        elif shim["kind"] == "ollama-cas":
+            models_root = _ollama_models_root(cache_path)
+            info = {"gguf": {"digest": rc.get("gguf_digest", "")},
+                    "small_blobs": [{"digest": d} for d in rc.get("small_blobs", [])],
+                    "manifest": rc.get("manifest", {}),
+                    "manifest_rel": rc.get("manifest_rel", "")}
+            _ollama_build_shim(info, store_dir, models_root)
+            rebuilt = True
+    return rebuilt
+
+
 def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "",
               category: str = "", dry_run: bool = False, keep_native: bool = False,
               registry_save: bool = True, json_output: bool = False) -> bool:
@@ -4171,9 +4214,11 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
         entry.storage = {
             "class": "managed-ollama", "store_path": store_rel, "ingested_at": _now_iso(),
             "shims": [{
-                "tool": "ollama", "kind": "ollama-cas", "location": info["manifest_rel"],
+                "tool": "ollama", "kind": "ollama-cas",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
                 "cache_root_var": "OLLAMA_MODELS",
                 "reconstruct": {"model": info["model"], "tag": info["tag"], "manifest": info["manifest"],
+                                "manifest_rel": info["manifest_rel"],
                                 "gguf_digest": info["gguf"]["digest"],
                                 "small_blobs": [b["digest"] for b in info["small_blobs"]]},
             }],
