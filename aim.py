@@ -1239,51 +1239,108 @@ def _resolve_download_dest(root: StorageRoot, model_id: str, category: str, expl
     return root.store_path / final_category / model_id, "auto"
 
 
+SOURCES: dict[str, dict] = {
+    "huggingface": {
+        "aliases": ["hf"],
+        "cache_layout": "cas-hf",
+        "tools": [
+            {"name": "hfd", "check": "path",
+             "install_cmd": "curl -fSL -o {root}/hfd.sh https://hf-mirror.com/hfd/hfd.sh && chmod +x {root}/hfd.sh && brew install wget aria2",
+             "description": "HuggingFace Download script (hfd.sh + wget + aria2)"},
+            {"name": "hf", "check": "which",
+             "install_cmd": "pip3 install --break-system-packages -U huggingface_hub",
+             "description": "HuggingFace CLI (hf)"},
+        ],
+        "env": [
+            {"name": "HF_HOME", "role": "cache_dir", "default": "~/.cache/huggingface",
+             "subpath": "hub", "detect": ["env", "rc", "tool"], "manage": "env_file", "secret": False},
+            {"name": "HF_HUB_CACHE", "role": "cache_dir_override", "default": "",
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+            {"name": "HF_ENDPOINT", "role": "endpoint", "default": "https://huggingface.co",
+             "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+            {"name": "HF_TOKEN", "role": "token", "default": "",
+             "detect": ["env", "tool"], "manage": "native", "secret": True},
+            {"name": "HF_HUB_ENABLE_HF_TRANSFER", "role": "accel", "default": "0",
+             "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+            {"name": "HF_XET_CACHE", "role": "regen_cache", "default": "",
+             "detect": ["env", "rc"], "manage": "none", "secret": False},
+        ],
+    },
+    "ollama": {
+        "aliases": [],
+        "cache_layout": "cas-ollama",
+        "tools": [
+            {"name": "ollama", "check": "which", "install_cmd": "brew install ollama",
+             "description": "Ollama CLI"},
+        ],
+        "env": [
+            {"name": "OLLAMA_MODELS", "role": "cache_dir", "default": "~/.ollama/models",
+             "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
+            {"name": "OLLAMA_HOST", "role": "endpoint", "default": "127.0.0.1:11434",
+             "detect": ["env", "rc"], "manage": "service", "secret": False},
+        ],
+    },
+    "modelscope": {
+        "aliases": ["ms"],
+        "cache_layout": "flat-ms",
+        "tools": [
+            {"name": "modelscope", "check": "which",
+             "install_cmd": "pip3 install --break-system-packages modelscope",
+             "description": "ModelScope CLI"},
+        ],
+        "env": [
+            {"name": "MODELSCOPE_CACHE", "role": "cache_dir", "default": "~/.cache/modelscope",
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+        ],
+    },
+    "url": {
+        "aliases": [],
+        "cache_layout": "flat",
+        "tools": [
+            {"name": "wget", "check": "which", "install_cmd": "brew install wget", "description": "GNU Wget"},
+            {"name": "curl", "check": "which", "install_cmd": "brew install curl", "description": "cURL"},
+        ],
+        "env": [],
+    },
+    "pytorch-hub": {
+        "aliases": ["torch", "pytorch"],
+        "cache_layout": "torch-hub",
+        "tools": [
+            {"name": "python3", "check": "which", "install_cmd": "brew install python",
+             "description": "Python (torch.hub)"},
+        ],
+        "env": [
+            {"name": "TORCH_HOME", "role": "cache_dir", "default": "~/.cache/torch",
+             "subpath": "hub", "detect": ["env", "rc", "tool"], "manage": "env_file", "secret": False},
+        ],
+    },
+    "civitai": {
+        "aliases": [],
+        "cache_layout": "flat",
+        "tools": [
+            {"name": "civitdl", "check": "which",
+             "install_cmd": "pip3 install --break-system-packages civitdl",
+             "description": "Civitai downloader (civitdl)"},
+        ],
+        "env": [
+            {"name": "CIVITAI_API_TOKEN", "role": "token", "default": "",
+             "detect": ["env"], "manage": "native", "secret": True},
+        ],
+    },
+    "git": {
+        "aliases": ["git-lfs"],
+        "cache_layout": "flat",
+        "tools": [
+            {"name": "git", "check": "which", "install_cmd": "brew install git", "description": "Git"},
+            {"name": "git-lfs", "check": "which", "install_cmd": "brew install git-lfs", "description": "Git LFS"},
+        ],
+        "env": [],
+    },
+}
+
+# Derived backward-compat view: existing download code reads _BACKEND_REGISTRY[type] -> [tool,...]
 _BACKEND_REGISTRY: dict[str, list[dict]] = {
-    "huggingface": [
-        {
-            "name": "hfd",
-            "check": "path",
-            "install_cmd": "curl -fSL -o {root}/hfd.sh https://hf-mirror.com/hfd/hfd.sh && chmod +x {root}/hfd.sh && brew install wget aria2",
-            "description": "HuggingFace Download script (hfd.sh + wget + aria2)",
-        },
-        {
-            "name": "hf",
-            "check": "which",
-            "install_cmd": "pip3 install --break-system-packages -U huggingface_hub",
-            "description": "HuggingFace CLI (hf)",
-        },
-    ],
-    "ollama": [
-        {
-            "name": "ollama",
-            "check": "which",
-            "install_cmd": "brew install ollama",
-            "description": "Ollama CLI",
-        },
-    ],
-    "modelscope": [
-        {
-            "name": "modelscope",
-            "check": "which",
-            "install_cmd": "pip3 install --break-system-packages modelscope",
-            "description": "ModelScope CLI",
-        },
-    ],
-    "url": [
-        {
-            "name": "wget",
-            "check": "which",
-            "install_cmd": "brew install wget",
-            "description": "GNU Wget",
-        },
-        {
-            "name": "curl",
-            "check": "which",
-            "install_cmd": "brew install curl",
-            "description": "cURL",
-        },
-    ],
+    key: spec["tools"] for key, spec in SOURCES.items() if spec.get("tools")
 }
 
 
