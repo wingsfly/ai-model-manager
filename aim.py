@@ -4019,6 +4019,32 @@ def _hf_build_shim(repo_dir: Path, store_dir: Path, commit: str, files: list) ->
     (repo_dir / "refs" / "main").write_text(commit)
 
 
+def _ms_read_native(repo_dir: Path) -> dict:
+    files = []
+    for f in sorted(repo_dir.rglob("*")):
+        if f.is_file() and not f.is_symlink():
+            files.append({"name": str(f.relative_to(repo_dir)), "real_path": str(f),
+                          "size": f.stat().st_size})
+    return {"files": files, "dir_name": repo_dir.name}
+
+
+def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
+    """Replace the MS cache model dir with a directory symlink -> store, ATOMICALLY.
+    The new symlink is created at a temp path FIRST, so the original dir stays intact until swap."""
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp = repo_dir.parent / (repo_dir.name + ".aim-tmp")
+    if tmp.is_symlink() or tmp.is_file():
+        tmp.unlink()
+    elif tmp.is_dir():
+        shutil.rmtree(tmp)
+    os.symlink(store_dir.resolve(), tmp)          # original untouched if this throws
+    if repo_dir.is_symlink() or repo_dir.is_file():
+        repo_dir.unlink()
+    elif repo_dir.is_dir():
+        shutil.rmtree(repo_dir)
+    os.rename(tmp, repo_dir)                       # swap in
+
+
 def _sanitize_ingest_id(entry: "ModelEntry", new_id: str) -> str:
     return _sanitize_model_id(new_id) if new_id else entry.id
 
@@ -4078,6 +4104,47 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
                 "cache_root_var": "HF_HOME",
                 "reconstruct": {"repo_id": info["repo_id"], "commit": info["commit"],
                                 "files": [f["name"] for f in info["files"]]},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
+    if tool == "modelscope":
+        info = _ms_read_native(cache_repo)
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "uncategorized"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} ({len(info['files'])} files) -> {store_rel}, "
+                  f"replace MS dir {cache_repo} with symlink")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            size = _ingest_to_store(info["files"], store_dir)
+            _ms_build_shim(cache_repo, store_dir)
+        except OSError as ex:
+            if store_dir.exists():
+                shutil.rmtree(store_dir, ignore_errors=True)
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": "managed-ms", "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": "modelscope", "kind": "ms-dir",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
+                "cache_root_var": "MODELSCOPE_CACHE",
+                "reconstruct": {"repo_id": entry.source.get("repo_id", ""), "dir_name": info["dir_name"]},
             }],
         }
         registry.add(entry)
