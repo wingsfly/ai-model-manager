@@ -291,13 +291,23 @@ exit 0
         self.assertIn("local-m1", ids)
 
     def test_convert_native_to_managed_store(self) -> None:
-        src_dir = self.home / "native-cas" / "hf-model"
-        src_dir.mkdir(parents=True, exist_ok=True)
-        (src_dir / "model.bin").write_bytes(b"z" * 2048)
+        # Build a proper HF CAS structure so the ingest delegation can read it.
+        commit = "abc123"
+        repo_dir = self.home / "hub" / "models--org--repo"
+        blobs = repo_dir / "blobs"
+        snap = repo_dir / "snapshots" / commit
+        blobs.mkdir(parents=True)
+        snap.mkdir(parents=True)
+        (repo_dir / "refs").mkdir(parents=True)
+        (repo_dir / "refs" / "main").write_text(commit)
+        blob0 = blobs / "sha0"
+        blob0.write_bytes(b"z" * 2048)
+        import os as _os
+        _os.symlink(_os.path.relpath(blob0, snap), snap / "model.bin")
 
         imp = self._run(
             "import",
-            str(src_dir),
+            str(repo_dir),
             "--id",
             "hf-native-demo",
             "--category",
@@ -311,28 +321,21 @@ exit 0
         )
         self.assertEqual(imp.returncode, 0, imp.stderr)
 
+        # convert now delegates to ingest (deprecated); verify it succeeds
         conv = self._run(
             "convert",
             "hf-native-demo",
-            "--new-id",
-            "hf-native-demo-managed",
             "--category",
             "asr/model",
-            "--json",
         )
         self.assertEqual(conv.returncode, 0, conv.stderr)
-        out = json.loads(conv.stdout.strip())
-        self.assertEqual(out["status"], "converted")
-        dst = Path(out["path"])
-        self.assertTrue(dst.exists())
-        self.assertTrue((dst / "model.bin").exists())
+        self.assertIn("deprecated", conv.stdout.lower())
 
         registry = json.loads((self.home / ".aim" / "registry.json").read_text())
         by_id = {m["id"]: m for m in registry.get("models", [])}
         self.assertIn("hf-native-demo", by_id)
-        self.assertIn("hf-native-demo-managed", by_id)
-        self.assertTrue(by_id["hf-native-demo"]["native_cas"])
-        self.assertFalse(by_id["hf-native-demo-managed"]["native_cas"])
+        self.assertFalse(by_id["hf-native-demo"]["native_cas"])
+        self.assertEqual(by_id["hf-native-demo"].get("storage", {}).get("class"), "managed-hf")
 
 
 if __name__ == "__main__":
