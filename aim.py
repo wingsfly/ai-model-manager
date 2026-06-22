@@ -50,7 +50,7 @@ CATEGORIES = [
 
 ENGINE_NAMES = [
     "ollama", "huggingface", "omlx", "comfyui", "whisper",
-    "coqui", "sparktts", "piper", "fish-speech",
+    "coqui", "sparktts", "piper", "fish-speech", "modelscope",
 ]
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
@@ -211,6 +211,7 @@ def default_config() -> dict:
             "sparktts":    {"enabled": True, "model_dir": "sparktts/pretrained_models"},
             "piper":       {"enabled": True, "model_dir": "piper"},
             "fish-speech": {"enabled": True, "model_dir": "services/fish-speech"},
+            "modelscope":  {"enabled": True, "model_dir": "modelscope", "native_cas": True},
         },
         "sources": {},
         "env": {"managed": False, "shells": [], "files": {}},
@@ -1041,6 +1042,59 @@ class FishSpeechAdapter(EngineAdapter):
         return True
 
 
+class ModelScopeAdapter(EngineAdapter):
+    name = "modelscope"
+
+    def supported_formats(self) -> list[str]:
+        return ["safetensors", "bin", "pt", "gguf"]
+
+    def scan(self) -> list[ScannedModel]:
+        results: list[ScannedModel] = []
+        base = self.base_path
+        for layout_root in (base / "models", base / "hub" / "models"):
+            if not layout_root.exists():
+                continue
+            for org_dir in sorted(layout_root.iterdir()):
+                if not org_dir.is_dir() or org_dir.name.startswith((".", "_")):
+                    continue
+                for repo_dir in sorted(org_dir.iterdir()):
+                    if not repo_dir.is_dir() or repo_dir.name.startswith((".", "_")):
+                        continue
+                    if not any(f.is_file() for f in repo_dir.rglob("*")):
+                        continue
+                    repo_name = repo_dir.name.replace("___", ".")
+                    repo_id = f"{org_dir.name}/{repo_name}"
+                    fmt = ""
+                    for f in repo_dir.iterdir():
+                        if f.suffix == ".safetensors":
+                            fmt = "safetensors"; break
+                        if f.suffix in (".bin", ".pt", ".gguf"):
+                            fmt = fmt or f.suffix[1:]
+                    results.append(ScannedModel(
+                        id=self._make_id(f"ms-{org_dir.name}-{repo_name}"),
+                        name=repo_id, path=str(repo_dir), engine=self.name, format=fmt,
+                        size_bytes=self._dir_size(repo_dir),
+                        category=self._infer_ms_category(repo_id),
+                        tags=["modelscope", org_dir.name],
+                        source={"type": "modelscope", "repo_id": repo_id},
+                        native_cas=True, is_directory=True))
+        return results
+
+    def _infer_ms_category(self, repo_id: str) -> str:
+        rl = repo_id.lower()
+        if any(k in rl for k in ["asr", "paraformer", "whisper", "sensevoice", "firered"]):
+            return "asr/model"
+        if any(k in rl for k in ["tts", "vocoder"]):
+            return "tts/model"
+        return "llm/chat"
+
+    def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
+        return []
+
+    def unprovision(self, model: ModelEntry) -> bool:
+        return False
+
+
 # Adapter registry
 ADAPTERS: dict[str, type[EngineAdapter]] = {
     "ollama": OllamaAdapter,
@@ -1052,6 +1106,7 @@ ADAPTERS: dict[str, type[EngineAdapter]] = {
     "sparktts": SparkTTSAdapter,
     "piper": PiperAdapter,
     "fish-speech": FishSpeechAdapter,
+    "modelscope": ModelScopeAdapter,
 }
 
 
