@@ -1735,6 +1735,74 @@ def op_env_path(config: dict, source: str, detector: Optional["EnvDetector"] = N
     return 0
 
 
+def _managed_env_pairs(config: dict) -> list:
+    """Collect (source, name, value) for manage:env_file vars from config sources managed_env."""
+    pairs = []
+    for key, spec in SOURCES.items():
+        managed_env = config.get("sources", {}).get(key, {}).get("managed_env", {})
+        env_file_names = [e["name"] for e in spec.get("env", [])
+                          if e.get("manage") == "env_file" and not e.get("secret")]
+        for name in env_file_names:
+            if name in managed_env:
+                pairs.append((key, name, managed_env[name]))
+    return pairs
+
+
+def _source_key_for_var(var: str) -> Optional[str]:
+    for key, spec in SOURCES.items():
+        if any(e["name"] == var for e in spec.get("env", [])):
+            return key
+    return None
+
+
+def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
+                 home: Optional[Path] = None, shell: str = "", set_vars: Optional[list] = None,
+                 service: bool = False, dry_run: bool = False) -> int:
+    home = Path(home) if home else Path.home()
+    writer = writer or ShellWriter(home=home)
+    for item in (set_vars or []):
+        if "=" not in item:
+            print(f"Invalid --set '{item}', expected VAR=VALUE", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        var, value = item.split("=", 1)
+        key = _source_key_for_var(var)
+        if not key:
+            print(f"Unknown variable: {var}", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        config.setdefault("sources", {}).setdefault(key, {}).setdefault("managed_env", {})[var] = value
+    pairs = _managed_env_pairs(config)
+    shells = ["zsh", "bash", "fish"] if shell == "all" else [shell or writer.detect_shell()]
+    if dry_run:
+        print("[dry-run] would write ~/.aim/env.sh, ~/.aim/env.fish and wire:", ", ".join(shells))
+        for s in shells:
+            rc_path, fmt = writer.target_rc(s)
+            r = writer.wire_rc(rc_path, fmt=fmt, dry_run=True)
+            print(f"  {s}: {r['action']} {r['path']}")
+        return 0
+    aim_dir = home / ".aim"
+    aim_dir.mkdir(parents=True, exist_ok=True)
+    (aim_dir / "env.sh").write_text(writer.render_env_file(pairs, fmt="sh"))
+    (aim_dir / "env.fish").write_text(writer.render_env_file(pairs, fmt="fish"))
+    wired = []
+    for s in shells:
+        rc_path, fmt = writer.target_rc(s)
+        r = writer.wire_rc(rc_path, fmt=fmt, dry_run=False)
+        wired.append(r["path"])
+    config.setdefault("env", {})
+    config["env"]["managed"] = True
+    config["env"]["shells"] = shells
+    config["env"]["files"] = {"posix": str(aim_dir / "env.sh"), "fish": str(aim_dir / "env.fish")}
+    if registry is not None:
+        save_config(config)
+    if service:
+        models = config.get("sources", {}).get("ollama", {}).get("cache_path", "~/.ollama/models")
+        print("Service-level env (run manually):")
+        for c in ServiceEnv.ollama_commands(models, platform.system()):
+            print(f"  {c}")
+    print(f"Wrote {aim_dir/'env.sh'}, {aim_dir/'env.fish'}; wired: {', '.join(wired)}")
+    return 0
+
+
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
     cfg = config.get("download", {})
     return DownloadOptions(

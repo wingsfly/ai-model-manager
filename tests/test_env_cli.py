@@ -47,5 +47,41 @@ class EnvShowTests(unittest.TestCase):
         self.assertIn(".cache/huggingface/hub", buf.getvalue())
 
 
+class EnvApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+
+    def _run(self, cfg, **kw):
+        writer = aim.ShellWriter(home=self.home)
+        return aim.op_env_apply(cfg, registry=None, writer=writer, home=self.home, **kw)
+
+    def test_apply_writes_env_file_and_wires_rc(self):
+        cfg = aim.default_config()
+        cfg["sources"]["huggingface"] = {"managed_env": {"HF_ENDPOINT": "https://hf-mirror.com"}}
+        rc = self.home / ".zshrc"; rc.write_text("# mine\n")
+        rc_code = self._run(cfg, shell="zsh", set_vars=[], service=False, dry_run=False)
+        self.assertEqual(rc_code, 0)
+        envf = (self.home / ".aim" / "env.sh").read_text()
+        self.assertIn('export HF_ENDPOINT="https://hf-mirror.com"', envf)
+        self.assertIn(aim.AIM_ENV_BEGIN, rc.read_text())
+        self.assertIn("# mine", rc.read_text())
+
+    def test_apply_set_flag_persists_to_config(self):
+        cfg = aim.default_config()
+        rc = self.home / ".zshrc"; rc.write_text("")
+        self._run(cfg, shell="zsh", set_vars=["HF_HUB_ENABLE_HF_TRANSFER=1"],
+                  service=False, dry_run=False)
+        self.assertEqual(
+            cfg["sources"]["huggingface"]["managed_env"]["HF_HUB_ENABLE_HF_TRANSFER"], "1")
+
+    def test_apply_dry_run_writes_nothing(self):
+        cfg = aim.default_config()
+        cfg["sources"]["huggingface"] = {"managed_env": {"HF_ENDPOINT": "https://x"}}
+        rc = self.home / ".zshrc"; rc.write_text("orig\n")
+        self._run(cfg, shell="zsh", set_vars=[], service=False, dry_run=True)
+        self.assertFalse((self.home / ".aim" / "env.sh").exists())
+        self.assertEqual(rc.read_text(), "orig\n")
+
+
 if __name__ == "__main__":
     unittest.main()
