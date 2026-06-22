@@ -1593,6 +1593,8 @@ def _sync_sources_cache_paths(config: dict, detector: "EnvDetector") -> dict:
 
 AIM_ENV_BEGIN = "# >>> aim env >>>"
 AIM_ENV_END = "# <<< aim env <<<"
+AIM_BASH_CHAIN_BEGIN = "# >>> aim bash-chain >>>"
+AIM_BASH_CHAIN_END = "# <<< aim bash-chain <<<"
 
 
 class ShellWriter:
@@ -1648,6 +1650,32 @@ class ShellWriter:
         rc_path.parent.mkdir(parents=True, exist_ok=True)
         rc_path.write_text(new)
         return {"action": action, "path": str(rc_path), "wrote": True}
+
+    def ensure_bash_login_chain(self, dry_run: bool = False) -> Optional[dict]:
+        """Ensure a bash LOGIN shell loads ~/.bashrc (macOS login bash reads ~/.bash_profile).
+        No-op if ~/.bash_profile or ~/.profile already sources ~/.bashrc, or chain already present."""
+        for cand in (self.home / ".bash_profile", self.home / ".profile"):
+            if cand.exists() and ".bashrc" in cand.read_text():
+                return None
+        profile = self.home / ".bash_profile"
+        existing = profile.read_text() if profile.exists() else ""
+        if AIM_BASH_CHAIN_BEGIN in existing:
+            return None
+        block = (f"{AIM_BASH_CHAIN_BEGIN}\n"
+                 '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n'
+                 f"{AIM_BASH_CHAIN_END}\n")
+        if dry_run:
+            return {"action": "chain", "path": str(profile), "wrote": False}
+        bak = profile.with_suffix(profile.suffix + ".aim.bak")
+        if profile.exists() and not bak.exists():
+            bak.write_text(existing)
+        if existing == "":
+            new = block
+        else:
+            sep = "" if existing.endswith("\n") else "\n"
+            new = existing + sep + "\n" + block
+        profile.write_text(new)
+        return {"action": "chain", "path": str(profile), "wrote": True}
 
     def target_rc(self, shell: str) -> tuple:
         if shell == "zsh":
@@ -1760,6 +1788,14 @@ def _source_key_for_var(var: str) -> Optional[str]:
     return None
 
 
+def _is_secret_var(var: str) -> bool:
+    for spec in SOURCES.values():
+        for e in spec.get("env", []):
+            if e["name"] == var:
+                return bool(e.get("secret"))
+    return False
+
+
 def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
                  home: Optional[Path] = None, shell: str = "", set_vars: Optional[list] = None,
                  service: bool = False, dry_run: bool = False) -> int:
@@ -1774,7 +1810,11 @@ def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
         if not key:
             print(f"Unknown variable: {var}", file=sys.stderr)
             return EXIT_INVALID_ARGS
-        config.setdefault("sources", {}).setdefault(key, {}).setdefault("managed_env", {})[var] = value
+        if _is_secret_var(var):
+            # secrets never go to config.json / env.sh / rc; store in the 0600 secrets file
+            SecretStore(home=home).set_secret(var, value)
+        else:
+            config.setdefault("sources", {}).setdefault(key, {}).setdefault("managed_env", {})[var] = value
     pairs = _managed_env_pairs(config)
     shells = ["zsh", "bash", "fish"] if shell == "all" else [shell or writer.detect_shell()]
     if dry_run:
@@ -1783,6 +1823,10 @@ def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
             rc_path, fmt = writer.target_rc(s)
             r = writer.wire_rc(rc_path, fmt=fmt, dry_run=True)
             print(f"  {s}: {r['action']} {r['path']}")
+            if s == "bash":
+                ch = writer.ensure_bash_login_chain(dry_run=True)
+                if ch:
+                    print(f"  bash: would chain {ch['path']} -> ~/.bashrc")
         return 0
     aim_dir = home / ".aim"
     aim_dir.mkdir(parents=True, exist_ok=True)
@@ -1793,6 +1837,8 @@ def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
         rc_path, fmt = writer.target_rc(s)
         r = writer.wire_rc(rc_path, fmt=fmt, dry_run=False)
         wired.append(r["path"])
+        if s == "bash":
+            writer.ensure_bash_login_chain(dry_run=False)
     config.setdefault("env", {})
     config["env"]["managed"] = True
     config["env"]["shells"] = shells
@@ -1800,7 +1846,7 @@ def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
     if registry is not None:
         save_config(config)
     if service:
-        models = config.get("sources", {}).get("ollama", {}).get("cache_path", "~/.ollama/models")
+        models = config.get("sources", {}).get("ollama", {}).get("cache_path") or str(home / ".ollama" / "models")
         print("Service-level env (run manually):")
         for c in ServiceEnv.ollama_commands(models, platform.system()):
             print(f"  {c}")

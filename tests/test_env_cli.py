@@ -101,6 +101,37 @@ class EnvApplyTests(unittest.TestCase):
         self.assertFalse((self.home / ".aim" / "env.sh").exists())
         self.assertEqual(rc.read_text(), "orig\n")
 
+    def test_apply_set_secret_goes_to_secretstore_not_config(self):
+        cfg = aim.default_config()
+        (self.home / ".zshrc").write_text("")
+        self._run(cfg, shell="zsh", set_vars=["HF_TOKEN=SECRET123"], service=False, dry_run=False)
+        self.assertNotIn("HF_TOKEN",
+                         cfg.get("sources", {}).get("huggingface", {}).get("managed_env", {}))
+        secrets = (self.home / ".aim" / "secrets.env").read_text()
+        self.assertIn('export HF_TOKEN="SECRET123"', secrets)
+        self.assertNotIn("SECRET123", (self.home / ".aim" / "env.sh").read_text())
+
+    def test_apply_bash_chains_profile_to_bashrc(self):
+        cfg = aim.default_config()
+        self._run(cfg, shell="bash", set_vars=[], service=False, dry_run=False)
+        self.assertIn(aim.AIM_ENV_BEGIN, (self.home / ".bashrc").read_text())
+        self.assertIn(".bashrc", (self.home / ".bash_profile").read_text())
+
+    def test_apply_bash_no_duplicate_chain(self):
+        cfg = aim.default_config()
+        (self.home / ".bash_profile").write_text("source ~/.bashrc\n")
+        self._run(cfg, shell="bash", set_vars=[], service=False, dry_run=False)
+        self.assertNotIn(aim.AIM_BASH_CHAIN_BEGIN, (self.home / ".bash_profile").read_text())
+
+    def test_apply_service_expands_ollama_tilde(self):
+        cfg = aim.default_config()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self._run(cfg, shell="zsh", set_vars=[], service=True, dry_run=False)
+        out = buf.getvalue()
+        self.assertNotIn('"~/.ollama', out)
+        self.assertIn(str(self.home / ".ollama" / "models"), out)
+
 
 class SourcesCliTests(unittest.TestCase):
     def setUp(self):
