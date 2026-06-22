@@ -1633,8 +1633,11 @@ class ShellWriter:
             post = existing.split(AIM_ENV_END, 1)[1]
             new = pre + block.rstrip("\n") + post
             action = "replace"
+        elif existing == "":
+            new = block
+            action = "append"
         else:
-            sep = "" if (existing == "" or existing.endswith("\n")) else "\n"
+            sep = "" if existing.endswith("\n") else "\n"
             new = existing + sep + "\n" + block
             action = "append"
         if dry_run:
@@ -1673,6 +1676,7 @@ class SecretStore:
         if self.path.exists():
             lines = [l for l in self.path.read_text().splitlines()
                      if not l.strip().startswith(f"export {name}=")]
+        # NOTE: values are assumed free of unescaped " or $ (tokens/paths in practice).
         lines.append(f'export {name}="{value}"')
         self.path.write_text("\n".join(lines) + "\n")
         os.chmod(self.path, 0o600)
@@ -1692,7 +1696,7 @@ class ServiceEnv:
                     "# restart the Ollama app for the change to take effect"]
         if system == "Linux":
             return ["mkdir -p ~/.config/systemd/user/ollama.service.d",
-                    f'printf "[Service]\\nEnvironment=OLLAMA_MODELS={models_path}\\n" '
+                    f"printf '[Service]\\nEnvironment=OLLAMA_MODELS={models_path}\\n' "
                     "> ~/.config/systemd/user/ollama.service.d/aim.conf",
                     "systemctl --user daemon-reload && systemctl --user restart ollama"]
         return [f"# set OLLAMA_MODELS={models_path} in your service manager"]

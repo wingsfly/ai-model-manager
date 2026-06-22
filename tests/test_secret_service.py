@@ -40,6 +40,11 @@ class ServiceEnvTests(unittest.TestCase):
         cmds = aim.ServiceEnv.ollama_commands("/data/ollama/models", "Linux")
         self.assertTrue(any("systemd" in c or "systemctl" in c for c in cmds))
 
+    def test_linux_path_with_spaces_preserved(self):
+        cmds = aim.ServiceEnv.ollama_commands("/data/AI Models/ollama", "Linux")
+        self.assertTrue(any("/data/AI Models/ollama" in c for c in cmds))
+        self.assertTrue(any("printf '" in c for c in cmds))  # single-quoted format
+
 
 if __name__ == "__main__":
     unittest.main()

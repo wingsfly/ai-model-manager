@@ -64,6 +64,17 @@ class WireRcTests(unittest.TestCase):
         self.assertEqual(self.w.target_rc("bash"), (self.home / ".bashrc", "sh"))
         self.assertEqual(self.w.target_rc("sh"), (self.home / ".profile", "sh"))
 
+    def test_empty_rc_no_leading_blank(self):
+        rc = self.home / ".bashrc"  # does not exist yet → empty case
+        self.w.wire_rc(rc, fmt="sh")
+        text = rc.read_text()
+        self.assertFalse(text.startswith("\n"))
+        self.assertTrue(text.startswith(aim.AIM_ENV_BEGIN))
+        # second run is idempotent
+        before = rc.read_text()
+        self.w.wire_rc(rc, fmt="sh")
+        self.assertEqual(rc.read_text(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
