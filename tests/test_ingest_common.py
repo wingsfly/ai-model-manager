@@ -133,8 +133,9 @@ class CrossSourceDedupTests(unittest.TestCase):
         ms_weight = ms_store / "model.safetensors"
         self.assertTrue(ms_weight.exists(), "MS store weight missing")
 
-        # Both store copies hold identical content → same _quick_hash
-        # → op_dedup would hardlink them once files exceed the 100 MB threshold.
+        # op_dedup uses a 100MB size threshold (impractical for a unit test), so we verify the
+        # dedup PRECONDITION: two byte-identical store copies hash equal, so `aim dedup` would
+        # hardlink them. The 100MB-scale hardlink path itself is not unit-tested.
         self.assertEqual(
             aim._quick_hash(hf_weight),
             aim._quick_hash(ms_weight),

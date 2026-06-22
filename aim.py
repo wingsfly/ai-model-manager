@@ -3542,8 +3542,6 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
             cache_path = Path(loc) if os.path.isabs(loc) else (Path(get_primary_root(config).path) / loc)
             if not (cache_path.exists() or cache_path.is_symlink()):
                 issues.append({"model": m.id, "error": "shim_missing", "path": str(cache_path)})
-                if fix and _rebuild_shim_from_storage(config, m):
-                    print(f"  Fixed shim for {m.id}")
 
     if not issues:
         print("All links verified OK.")
@@ -3570,6 +3568,15 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
                             lt,
                         )
                         print(f"  Fixed: {target}")
+            elif issue.get("error") == "shim_missing":
+                model_id = issue["model"]
+                model = registry.find(model_id)
+                if model:
+                    try:
+                        if _rebuild_shim_from_storage(config, model):
+                            print(f"  Rebuilt shim for {model_id}")
+                    except Exception as ex:
+                        print(f"  Could not rebuild shim for {model_id}: {ex}")
 
     return issues
 
