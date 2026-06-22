@@ -3905,6 +3905,32 @@ def op_root_list(config: dict) -> None:
         print(f"{r['id']:<15} {r.get('label', ''):<20} {r['path']:<40} {used:<12} {free:<12}")
 
 
+# ── Native Ingest (SP2) ──────────────────────────────────────────────────────
+
+
+def _hf_read_native(repo_dir: Path) -> dict:
+    """Read a HuggingFace cache repo dir (models--org--repo) into reconstruct metadata.
+    Returns {repo_id, commit, files: [{name, real_path, size}]} using the current snapshot."""
+    parts = repo_dir.name.split("--", 2)
+    repo_id = f"{parts[1]}/{parts[2]}" if len(parts) == 3 else repo_dir.name
+    refs_main = repo_dir / "refs" / "main"
+    commit = refs_main.read_text().strip() if refs_main.exists() else ""
+    snap = repo_dir / "snapshots" / commit
+    if not snap.is_dir():
+        snaps = [d for d in (repo_dir / "snapshots").iterdir() if d.is_dir()] if (repo_dir / "snapshots").exists() else []
+        snap = snaps[0] if snaps else snap
+        commit = commit or (snap.name if snaps else "")
+    files = []
+    if snap.is_dir():
+        for f in sorted(snap.rglob("*")):
+            if f.is_file() or f.is_symlink():
+                real = f.resolve()
+                if real.is_file():
+                    files.append({"name": str(f.relative_to(snap)), "real_path": str(real),
+                                  "size": real.stat().st_size})
+    return {"repo_id": repo_id, "commit": commit, "files": files}
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}
