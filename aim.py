@@ -405,9 +405,13 @@ class EngineAdapter:
         self.enabled = engine_cfg.get("enabled", True)
         self.model_dir = engine_cfg.get("model_dir", "")
         self.native_cas = engine_cfg.get("native_cas", False)
+        self._cache_path = config.get("sources", {}).get(self.name, {}).get("cache_path", "")
 
     @property
     def base_path(self) -> Path:
+        # Native-CAS engines (HF/Ollama): prefer the detected real cache location.
+        if self.native_cas and self._cache_path:
+            return Path(self._cache_path)
         return Path(self.root.path) / self.model_dir
 
     def scan(self) -> list[ScannedModel]:
