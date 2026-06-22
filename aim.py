@@ -1660,6 +1660,44 @@ class ShellWriter:
         return base if base in ("zsh", "bash", "fish") else "sh"
 
 
+class SecretStore:
+    """Store secrets (tokens) outside shell rc / env files, in a 0600 file."""
+
+    def __init__(self, home: Optional[Path] = None):
+        self.home = Path(home) if home else Path.home()
+        self.path = self.home / ".aim" / "secrets.env"
+
+    def set_secret(self, name: str, value: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        if self.path.exists():
+            lines = [l for l in self.path.read_text().splitlines()
+                     if not l.strip().startswith(f"export {name}=")]
+        lines.append(f'export {name}="{value}"')
+        self.path.write_text("\n".join(lines) + "\n")
+        os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def mask(value: str) -> str:
+        return "set (****)" if value else "unset"
+
+
+class ServiceEnv:
+    """Render commands to set daemon-level env (e.g. ollama server) that ignores shell rc."""
+
+    @staticmethod
+    def ollama_commands(models_path: str, system: str) -> list[str]:
+        if system == "Darwin":
+            return [f'launchctl setenv OLLAMA_MODELS "{models_path}"',
+                    "# restart the Ollama app for the change to take effect"]
+        if system == "Linux":
+            return ["mkdir -p ~/.config/systemd/user/ollama.service.d",
+                    f'printf "[Service]\\nEnvironment=OLLAMA_MODELS={models_path}\\n" '
+                    "> ~/.config/systemd/user/ollama.service.d/aim.conf",
+                    "systemctl --user daemon-reload && systemctl --user restart ollama"]
+        return [f"# set OLLAMA_MODELS={models_path} in your service manager"]
+
+
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
     cfg = config.get("download", {})
     return DownloadOptions(
