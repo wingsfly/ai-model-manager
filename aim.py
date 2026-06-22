@@ -1064,6 +1064,8 @@ def get_adapter(name: str, config: dict, root: StorageRoot) -> EngineAdapter:
 def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[ScannedModel]:
     """Scan engine directories and register discovered models."""
     root = get_primary_root(config)
+    # Align config to where tools actually cache models, so we scan the right dirs.
+    _sync_sources_cache_paths(config, EnvDetector())
     all_scanned: list[ScannedModel] = []
     engines = [engine_filter] if engine_filter else list(config.get("engines", {}).keys())
 

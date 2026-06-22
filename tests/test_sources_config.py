@@ -54,5 +54,29 @@ class AdapterBasePathTests(unittest.TestCase):
         self.assertEqual(ad.base_path, Path("/home/u/AI/omlx"))
 
 
+class ScanAutoAlignTests(unittest.TestCase):
+    def test_sync_helper_populates_hf_cache_path(self):
+        cfg = aim.default_config()
+        det = aim.EnvDetector(home=Path("/h"), rc_files=[], shell_value=lambda v: None)
+        aim._sync_sources_cache_paths(cfg, det)
+        self.assertTrue(cfg["sources"]["huggingface"]["cache_path"].endswith("/.cache/huggingface/hub"))
+
+    def test_op_scan_calls_sync(self):
+        # op_scan should call _sync_sources_cache_paths at entry; verify via monkeypatch
+        cfg = aim.default_config()
+        called = {"n": 0}
+        orig = aim._sync_sources_cache_paths
+        def spy(c, d):
+            called["n"] += 1
+            return orig(c, d)
+        aim._sync_sources_cache_paths = spy
+        try:
+            reg = aim.Registry()
+            aim.op_scan(cfg, reg, engine_filter="huggingface")
+        finally:
+            aim._sync_sources_cache_paths = orig
+        self.assertGreaterEqual(called["n"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
