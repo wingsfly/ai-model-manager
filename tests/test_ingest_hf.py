@@ -112,6 +112,40 @@ class HFIngestTests(unittest.TestCase):
         self.assertTrue((repo_dir / "blobs").exists())
         self.assertEqual(reg.find("hf-org-model").storage, {})
 
+    def test_ingest_removes_blobs_by_default(self):
+        repo_dir = make_hf_cache(self.home, files=(("config.json", b"{}"), ("model.safetensors", b"W" * 50)))
+        reg = aim.Registry()
+        reg.models = [self._entry_for(repo_dir)]
+        aim.op_ingest(self.config, reg, "hf-org-model", registry_save=False)
+        self.assertFalse((repo_dir / "blobs").exists())  # default reclaims space
+
+    def test_ingest_keep_native_keeps_blobs(self):
+        repo_dir = make_hf_cache(self.home, files=(("config.json", b"{}"), ("model.safetensors", b"W" * 50)))
+        reg = aim.Registry()
+        reg.models = [self._entry_for(repo_dir)]
+        aim.op_ingest(self.config, reg, "hf-org-model", keep_native=True, registry_save=False)
+        self.assertTrue((repo_dir / "blobs").exists())  # kept
+
+    def test_no_dataloss_on_symlink_failure(self):
+        repo_dir = make_hf_cache(self.home, files=(("config.json", b"{}"), ("model.safetensors", b"DATA" * 10)))
+        reg = aim.Registry()
+        reg.models = [self._entry_for(repo_dir)]
+        orig = aim.os.symlink
+        aim.os.symlink = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        try:
+            ok = aim.op_ingest(self.config, reg, "hf-org-model", registry_save=False)
+        finally:
+            aim.os.symlink = orig
+        self.assertFalse(ok)
+        self.assertTrue((repo_dir / "blobs").exists())                      # blobs intact
+        link = repo_dir / "snapshots" / "abc123" / "model.safetensors"
+        self.assertEqual(link.resolve().read_bytes(), b"DATA" * 10)         # original snapshot still loads
+        store_dir = Path(self.root.path) / "store" / "asr/model" / "hf-org-model"
+        self.assertFalse(store_dir.exists())                               # store rolled back
+        e = reg.find("hf-org-model")
+        self.assertTrue(e.native_cas)
+        self.assertEqual(e.storage, {})
+
 
 class HFRollbackTests(unittest.TestCase):
     def setUp(self):
@@ -150,13 +184,14 @@ class HFBuildShimTests(unittest.TestCase):
         _write(store / "model.safetensors", b"WEIGHTS")
         repo_dir = self.home / "hub" / "models--Org--Model"
         files = [{"name": "config.json"}, {"name": "model.safetensors"}]
+        _write(repo_dir / "blobs" / "sha0", b"BLOB")
         aim._hf_build_shim(repo_dir, store, commit="abc123", files=files)
         self.assertEqual((repo_dir / "refs" / "main").read_text(), "abc123")
         link = repo_dir / "snapshots" / "abc123" / "model.safetensors"
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.resolve(), (store / "model.safetensors").resolve())
         self.assertEqual(link.read_bytes(), b"WEIGHTS")
-        self.assertFalse((repo_dir / "blobs").exists())
+        self.assertTrue((repo_dir / "blobs").exists())  # _hf_build_shim must NOT delete blobs
 
 
 if __name__ == "__main__":

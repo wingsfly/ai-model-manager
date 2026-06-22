@@ -3945,22 +3945,23 @@ def _ingest_to_store(files: list, dest: Path) -> int:
 
 
 def _hf_build_shim(repo_dir: Path, store_dir: Path, commit: str, files: list) -> None:
-    """Rebuild a HF cache repo as a shim: snapshots/<commit>/<file> -> absolute symlink into store."""
-    blobs = repo_dir / "blobs"
-    if blobs.exists():
-        shutil.rmtree(blobs)
+    """Rebuild snapshots/<commit> as absolute symlinks into store, atomically via a temp dir.
+    Does NOT touch blobs/ (caller removes them only after the shim is built, gated on keep_native).
+    On failure the original snapshot dir is left intact (temp dir is swapped in only on success)."""
     (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
-    (repo_dir / "refs" / "main").write_text(commit)
     snap = repo_dir / "snapshots" / commit
-    if snap.exists():
-        shutil.rmtree(snap)
-    snap.mkdir(parents=True, exist_ok=True)
+    tmp = repo_dir / "snapshots" / (commit + ".aim-tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
     for f in files:
-        target = snap / f["name"]
+        target = tmp / f["name"]
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            target.unlink()
         os.symlink((store_dir / f["name"]).resolve(), target)
+    if snap.exists() or snap.is_symlink():
+        shutil.rmtree(snap)
+    tmp.rename(snap)
+    (repo_dir / "refs" / "main").write_text(commit)
 
 
 def _sanitize_ingest_id(entry: "ModelEntry", new_id: str) -> str:
@@ -4000,6 +4001,10 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
         try:
             size = _ingest_to_store(info["files"], store_dir)
             _hf_build_shim(cache_repo, store_dir, info["commit"], info["files"])
+            if not keep_native:
+                blobs = cache_repo / "blobs"
+                if blobs.exists():
+                    shutil.rmtree(blobs)
         except OSError as ex:
             if store_dir.exists():
                 shutil.rmtree(store_dir, ignore_errors=True)
