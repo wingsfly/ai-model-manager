@@ -1058,7 +1058,7 @@ class ModelScopeAdapter(EngineAdapter):
                 if not org_dir.is_dir() or org_dir.name.startswith((".", "_")):
                     continue
                 for repo_dir in sorted(org_dir.iterdir()):
-                    if not repo_dir.is_dir() or repo_dir.name.startswith((".", "_")):
+                    if repo_dir.is_symlink() or not repo_dir.is_dir() or repo_dir.name.startswith((".", "_")):
                         continue
                     if not any(f.is_file() for f in repo_dir.rglob("*")):
                         continue
@@ -1066,9 +1066,9 @@ class ModelScopeAdapter(EngineAdapter):
                     repo_id = f"{org_dir.name}/{repo_name}"
                     fmt = ""
                     for f in repo_dir.iterdir():
-                        if f.suffix == ".safetensors":
+                        if f.suffix == ".safetensors" and f.is_file():
                             fmt = "safetensors"; break
-                        if f.suffix in (".bin", ".pt", ".gguf"):
+                        if f.suffix in (".bin", ".pt", ".gguf") and f.is_file():
                             fmt = fmt or f.suffix[1:]
                     results.append(ScannedModel(
                         id=self._make_id(f"ms-{org_dir.name}-{repo_name}"),
@@ -4029,20 +4029,30 @@ def _ms_read_native(repo_dir: Path) -> dict:
 
 
 def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
-    """Replace the MS cache model dir with a directory symlink -> store, ATOMICALLY.
-    The new symlink is created at a temp path FIRST, so the original dir stays intact until swap."""
+    """Replace the MS cache model dir with a directory symlink -> store, safely.
+    The original is renamed aside first; if creating the symlink fails it is restored,
+    so there is never a moment where both the original and the store copy could be lost."""
     repo_dir.parent.mkdir(parents=True, exist_ok=True)
-    tmp = repo_dir.parent / (repo_dir.name + ".aim-tmp")
-    if tmp.is_symlink() or tmp.is_file():
-        tmp.unlink()
-    elif tmp.is_dir():
-        shutil.rmtree(tmp)
-    os.symlink(store_dir.resolve(), tmp)          # original untouched if this throws
-    if repo_dir.is_symlink() or repo_dir.is_file():
-        repo_dir.unlink()
-    elif repo_dir.is_dir():
-        shutil.rmtree(repo_dir)
-    os.rename(tmp, repo_dir)                       # swap in
+    link = store_dir.resolve()
+    backup = repo_dir.parent / (repo_dir.name + ".aim-old")
+    if backup.is_symlink() or backup.is_file():
+        backup.unlink()
+    elif backup.is_dir():
+        shutil.rmtree(backup)
+    had_original = repo_dir.exists() or repo_dir.is_symlink()
+    if had_original:
+        os.rename(repo_dir, backup)            # original -> backup (atomic; original intact if this throws)
+    try:
+        os.symlink(link, repo_dir)             # create the shim
+    except OSError:
+        if had_original and not (repo_dir.exists() or repo_dir.is_symlink()):
+            os.rename(backup, repo_dir)        # restore original on failure
+        raise
+    if had_original and (backup.exists() or backup.is_symlink()):
+        if backup.is_dir() and not backup.is_symlink():
+            shutil.rmtree(backup)
+        else:
+            backup.unlink()
 
 
 def _sanitize_ingest_id(entry: "ModelEntry", new_id: str) -> str:

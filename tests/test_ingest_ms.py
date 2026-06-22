@@ -1,5 +1,6 @@
 import unittest
 import os
+import shutil
 import tempfile
 from pathlib import Path
 import aim
@@ -42,6 +43,18 @@ class ModelScopeAdapterTests(unittest.TestCase):
         self.assertIn("Qwen/Qwen3-ASR-0.6B", repo_ids)
         self.assertIn("funasr/paraformer-zh", repo_ids)
         self.assertTrue(all(s.native_cas and s.is_directory for s in scanned))
+
+    def test_scan_skips_shimmed_symlink_dirs(self):
+        import shutil as _sh
+        d = make_ms_cache(self.cache, "models", "Org", "M")
+        store = self.cache / "AI" / "store" / "asr" / "model" / "ms-org-m"
+        store.mkdir(parents=True)
+        _write(store / "model.safetensors", b"W")
+        _sh.rmtree(d)
+        os.symlink(store, d)
+        ad = aim.ModelScopeAdapter(self.config, self.root)
+        repo_ids = [s.source["repo_id"] for s in ad.scan()]
+        self.assertNotIn("Org/M", repo_ids)
 
 
 class MSIngestTests(unittest.TestCase):
