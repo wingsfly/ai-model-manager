@@ -208,6 +208,8 @@ def default_config() -> dict:
             "piper":       {"enabled": True, "model_dir": "piper"},
             "fish-speech": {"enabled": True, "model_dir": "services/fish-speech"},
         },
+        "sources": {},
+        "env": {"managed": False, "shells": [], "files": {}},
     }
 
 
@@ -1554,6 +1556,16 @@ class EnvDetector:
             for entry in spec.get("env", []):
                 rows.append({"source": key, **self.resolve(key, entry)})
         return rows
+
+
+def _sync_sources_cache_paths(config: dict, detector: "EnvDetector") -> dict:
+    """Write each source's detected cache location into config['sources'][k]['cache_path']."""
+    sources = config.setdefault("sources", {})
+    for key in SOURCES:
+        cd = detector.cache_dir(key)
+        if cd is not None:
+            sources.setdefault(key, {})["cache_path"] = str(cd)
+    return config
 
 
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
