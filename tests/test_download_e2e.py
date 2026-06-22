@@ -211,9 +211,9 @@ exit 0
             capture_output=True,
         )
         self.assertEqual(p.returncode, 4)
-        summary = json.loads(p.stdout.strip().splitlines()[-1])
-        self.assertEqual(summary["status"], "failed")
-        self.assertEqual(summary["error"]["code"], "BACKEND_NOT_FOUND")
+        output = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertEqual(output["error"]["code"], "BACKEND_NOT_FOUND")
+        self.assertIn("install_hint", output["error"])
 
     def test_cancel_flow(self) -> None:
         self._install_wget_slow()

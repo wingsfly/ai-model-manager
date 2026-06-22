@@ -1239,6 +1239,131 @@ def _resolve_download_dest(root: StorageRoot, model_id: str, category: str, expl
     return root.store_path / final_category / model_id, "auto"
 
 
+_BACKEND_REGISTRY: dict[str, list[dict]] = {
+    "huggingface": [
+        {
+            "name": "hfd",
+            "check": "path",
+            "install_cmd": "curl -fSL -o {root}/hfd.sh https://hf-mirror.com/hfd/hfd.sh && chmod +x {root}/hfd.sh && brew install wget aria2",
+            "description": "HuggingFace Download script (hfd.sh + wget + aria2)",
+        },
+        {
+            "name": "hf",
+            "check": "which",
+            "install_cmd": "pip3 install --break-system-packages -U huggingface_hub",
+            "description": "HuggingFace CLI (hf)",
+        },
+    ],
+    "ollama": [
+        {
+            "name": "ollama",
+            "check": "which",
+            "install_cmd": "brew install ollama",
+            "description": "Ollama CLI",
+        },
+    ],
+    "modelscope": [
+        {
+            "name": "modelscope",
+            "check": "which",
+            "install_cmd": "pip3 install --break-system-packages modelscope",
+            "description": "ModelScope CLI",
+        },
+    ],
+    "url": [
+        {
+            "name": "wget",
+            "check": "which",
+            "install_cmd": "brew install wget",
+            "description": "GNU Wget",
+        },
+        {
+            "name": "curl",
+            "check": "which",
+            "install_cmd": "brew install curl",
+            "description": "cURL",
+        },
+    ],
+}
+
+
+def _check_backend_available(tool_entry: dict, config: dict) -> bool:
+    if tool_entry["check"] == "which":
+        return shutil.which(tool_entry["name"]) is not None
+    if tool_entry["check"] == "path":
+        root_path = config.get("roots", [{}])[0].get("path", "")
+        return (Path(root_path) / "hfd.sh").exists() if root_path else False
+    return False
+
+
+def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_confirm: bool) -> tuple[bool, str]:
+    tools = _BACKEND_REGISTRY.get(source_type)
+    if not tools:
+        return True, ""
+    for t in tools:
+        if _check_backend_available(t, config):
+            return True, ""
+    root_path = config.get("roots", [{}])[0].get("path", "")
+    missing = []
+    for t in tools:
+        cmd = t["install_cmd"].replace("{root}", root_path)
+        missing.append({"name": t["name"], "install_cmd": cmd, "description": t["description"]})
+    if json_output and not auto_confirm:
+        err = json.dumps({
+            "error": {
+                "code": "BACKEND_NOT_FOUND",
+                "message": f"No backend tool available for {source_type} downloads.",
+                "retryable": False,
+                "install_hint": {
+                    "tools": missing,
+                    "note": "Install any one of the above tools, then retry. Use -y to auto-install.",
+                },
+            }
+        }, ensure_ascii=False)
+        return False, err
+    if not json_output:
+        print(f"No backend tool found for {source_type} downloads.")
+        print("Available options:")
+        for i, m in enumerate(missing):
+            print(f"  {i + 1}. {m['description']}: {m['install_cmd']}")
+        print()
+    if not auto_confirm and not json_output:
+        try:
+            answer = input(f"Install {missing[0]['description']}? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return False, ""
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return False, ""
+    for candidate in missing:
+        if not json_output:
+            print(f"Running: {candidate['install_cmd']}")
+        rc = subprocess.run(candidate["install_cmd"], shell=True).returncode
+        if rc != 0:
+            if not json_output:
+                print(f"  {candidate['description']} install failed (exit code {rc}).")
+            continue
+        for t in tools:
+            if _check_backend_available(t, config):
+                if not json_output:
+                    print(f"{candidate['description']} installed successfully.")
+                return True, ""
+    msg = "All installation attempts failed."
+    if json_output:
+        err = json.dumps({
+            "error": {
+                "code": "INSTALL_FAILED",
+                "message": msg,
+                "retryable": False,
+                "install_hint": {"tools": missing},
+            }
+        }, ensure_ascii=False)
+        return False, err
+    print(msg)
+    return False, ""
+
+
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
     cfg = config.get("download", {})
     return DownloadOptions(
@@ -1697,7 +1822,7 @@ def op_download_cancel(job_id: str, json_output: bool = False) -> int:
 def op_download(config: dict, registry: Registry, source_str: str,
                 name: str = "", category: str = "", path: str = "",
                 json_output: bool = False, options: Optional[DownloadOptions] = None,
-                force_redownload: bool = False) -> int:
+                force_redownload: bool = False, auto_confirm: bool = False) -> int:
     """Download a model from a source."""
     root = get_primary_root(config)
     options = options or DownloadOptions()
@@ -1710,6 +1835,12 @@ def op_download(config: dict, registry: Registry, source_str: str,
             print(f"Error: {msg}")
             print("Supported: hf:org/repo, ollama:model:tag, url:https://..., ms:org/repo")
         return EXIT_INVALID_ARGS
+
+    ok, err_output = _ensure_backend(source["type"], config, json_output, auto_confirm)
+    if not ok:
+        if err_output:
+            print(err_output)
+        return EXIT_BACKEND_MISSING
 
     inferred = _infer_download_category(source, model_id, explicit_category=category)
     final_category = category or inferred or "uncategorized"
@@ -2079,13 +2210,16 @@ def op_download(config: dict, registry: Registry, source_str: str,
 def _download_hf(repo_id: str, dest: Path, config: dict, options: DownloadOptions, job_state: dict, on_progress: Optional[Any] = None) -> DownloadResult:
     tool = config.get("defaults", {}).get("hf_download_tool", "hfd")
     hfd_path = Path(config.get("roots", [{}])[0].get("path", "")) / "hfd.sh"
-    backend_name = "huggingface-cli"
+    backend_name = "hf"
 
     if tool == "hfd" and hfd_path.exists():
         cmd = ["bash", str(hfd_path), repo_id, "--local-dir", str(dest)]
         backend_name = "hfd"
+    elif shutil.which("hf"):
+        cmd = ["hf", "download", repo_id, "--local-dir", str(dest)]
+        backend_name = "hf"
     else:
-        # fallback to huggingface-cli
+        # legacy fallback to huggingface-cli
         cmd = ["huggingface-cli", "download", repo_id, "--local-dir", str(dest)]
         backend_name = "huggingface-cli"
     cmd.extend(options.backend_args or [])
@@ -3481,6 +3615,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", dest="resume", action="store_true", default=True, help="Resume partial download when supported (default)")
     p.add_argument("--no-resume", dest="resume", action="store_false", help="Disable resume behavior")
     p.add_argument("--force-redownload", action="store_true", dest="force_redownload", help="Redownload even if model already exists")
+    p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Auto-confirm installation of missing backend tools")
 
     # provision
     p = sub.add_parser("provision", help="Create engine links for a model")
@@ -3700,6 +3835,7 @@ def main() -> int:
             json_output=args.json_output,
             options=options,
             force_redownload=args.force_redownload,
+            auto_confirm=args.auto_confirm,
         )
 
     elif cmd == "provision":
