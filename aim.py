@@ -105,6 +105,10 @@ class ModelEntry:
     # "symlink"|"hardlink"|"reference"}. Surfaced by info/verify, warned on delete,
     # re-pointed on migrate. Registered via `aim link` (manually or --scan).
     external_links: list[dict] = field(default_factory=list)
+    # SP2: how this model is physically stored + how each tool loads it (shims).
+    # {"class": "managed-hf|managed-ollama|managed-ms|managed-flat",
+    #  "store_path": "<relative-to-root>", "ingested_at": str, "shims": [ {...} ]}
+    storage: dict = field(default_factory=dict)
     added_at: str = ""
 
     def to_dict(self) -> dict:
