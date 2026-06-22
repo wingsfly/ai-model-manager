@@ -1458,19 +1458,32 @@ class EnvDetector:
 
     def scan_rc(self, var: str) -> list[tuple[str, str]]:
         pat_sh = re.compile(r'^\s*(?:export\s+)?' + re.escape(var) + r'=(.+)$')
-        pat_fish = re.compile(r'^\s*set\s+(?:-\S+\s+)*' + re.escape(var) + r'\s+(.+)$')
+        pat_fish = re.compile(r'^\s*set\s+((?:-\S+\s+)*)' + re.escape(var) + r'\s+(.+)$')
         found: list[tuple[str, str]] = []
         for f in self.rc_files():
             try:
                 for line in f.read_text().splitlines():
                     if line.strip().startswith("#"):
                         continue
-                    m = pat_sh.match(line) or pat_fish.match(line)
-                    if m:
-                        found.append((str(f), m.group(1).strip().strip('"').strip("'")))
+                    m_sh = pat_sh.match(line)
+                    if m_sh:
+                        found.append((str(f), self._clean_value(m_sh.group(1))))
+                        continue
+                    m_fish = pat_fish.match(line)
+                    if m_fish and "x" in m_fish.group(1):  # only exported fish vars (-gx/-x/-Ux)
+                        found.append((str(f), self._clean_value(m_fish.group(2))))
             except OSError:
                 continue
         return found
+
+    @staticmethod
+    def _clean_value(raw: str) -> str:
+        val = raw.strip()
+        if val[:1] not in ('"', "'"):
+            for sep in (" #", "\t#"):
+                if sep in val:
+                    val = val.split(sep, 1)[0].rstrip()
+        return val.strip('"').strip("'")
 
     def login_shell_value(self, var: str) -> Optional[str]:
         if self._shell_value is not None:
@@ -1481,7 +1494,7 @@ class EnvDetector:
             if base == "fish":
                 cmd = [shell, "-c", f"echo ${var}"]
             else:
-                cmd = [shell, "-ic", f'printf "%s" "${var}"']
+                cmd = [shell, "-lic", f'printf "%s" "${var}"']
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             return r.stdout.strip() or None
         except (OSError, subprocess.SubprocessError):
@@ -1509,7 +1522,7 @@ class EnvDetector:
             status = "unset"
             effective = self.expand(entry.get("default", "")) or ""
             source = "default"
-        elif len(rc_values) > 1:
+        elif source.startswith("rc") and len(rc_values) > 1:
             status = "conflict"
         elif recommended and effective != recommended:
             status = "drift"
