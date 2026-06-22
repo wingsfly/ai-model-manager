@@ -161,6 +161,37 @@ aim download ms:Qwen/Qwen2-7B --category llm/chat
 
 ---
 
+---
+
+### aim ingest — 原生模型摇入 store
+
+把 HuggingFace / Ollama / ModelScope 的原生缓存模型「摇入」`store/{类别}/{id}/` 扁平单目录，并在工具原缓存位置重建「加载壳」指回 store，使工具仍能原生加载；同时在 registry 写入 `storage` 标注（供备份/还原与 `aim verify --fix` 重建壳）。**取代旧的 `aim convert`**（旧实现会把缓存复制成 CAS 结构、体积翻倍且工具无法加载）。
+
+```bash
+aim ingest <model_id>            # 摇入单个原生模型
+aim ingest --all-native          # 摇入所有 native_cas 模型(HF/Ollama/MS)
+aim ingest <model_id> --dry-run  # 预览，不改任何文件
+aim ingest <model_id> --keep-native   # 保留原生字节(默认回收)
+aim ingest <model_id> --new-id NEW --category CAT
+```
+
+**三种工具的壳：**
+- **HuggingFace**：`{HF_HOME}/hub/models--org--repo/` 的 `snapshots/<commit>/<file>` 重建为指向 store 的绝对软链（删除 `blobs/`，除非 `--keep-native`）；`from_pretrained("org/repo")` 照常。
+- **Ollama**：GGUF 以硬链接共享进 store（同 inode，缓存不动）；小 blob 与 manifest 复制进 store 作元数据。`ollama run` 照常。
+- **ModelScope**：缓存里的模型目录换成指向 store 的目录软链（含 `.msc/.mdl/.mv` 元数据）。
+
+**安全：** copy 优先，壳建好前原生字节始终完好；失败自动回滚，绝不丢数据；`--dry-run` 不落盘。
+
+### aim convert（已弃用）
+
+`aim convert` 现在是 `aim ingest` 的弃用别名，会打印提示并委托给 ingest。请改用 `aim ingest`。
+
+### aim verify --fix（扩展）
+
+除原有链接校验外，`aim verify` 现在还校验每个已摇入模型的「加载壳」是否仍指向 store；`aim verify --fix` 会**用 `storage` 标注重建丢失/损坏的壳**（HF snapshots、Ollama blobs+manifest、MS 目录软链），是「壳可再生」的自愈能力，也预演了备份还原（SP3）。
+
+---
+
 ### aim provision — 为引擎创建链接
 
 将 store 中的模型链接到引擎目录，使引擎可以直接使用。

@@ -67,8 +67,13 @@ aim download hf:org/repo --proxy http://127.0.0.1:7890 --retry 3 --retry-backoff
 # Import/register existing local model path
 aim import /path/to/local/model-dir --id my-model --category llm/chat
 
-# Convert native CAS model to managed store model
-aim convert hf-org-repo --new-id hf-org-repo-managed --category llm/chat
+# Ingest a native-cache model (HF/Ollama/ModelScope) into the store + rebuild its load shim
+aim ingest <model_id>                 # one model: copy real files flat into store/, rebuild the tool's load shim
+aim ingest --all-native               # ingest all native_cas (HF/Ollama/MS) models
+aim ingest <model_id> --dry-run       # preview, change nothing
+aim ingest <model_id> --keep-native   # keep original native bytes (default reclaims them)
+aim convert <model_id>                # deprecated alias -> ingest
+aim verify --fix                      # also rebuilds storage shims from the recorded annotation
 
 # Provision a model for an engine
 aim provision <model_id> --engine comfyui
