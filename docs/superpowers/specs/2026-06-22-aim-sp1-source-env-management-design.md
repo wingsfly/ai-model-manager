@@ -209,9 +209,13 @@ SOURCES["huggingface"] = {
 ```
 
 ### 8.3 目标性清理（serves the goal，不做无关重构）
-让 `sources.<key>.cache_path` 成为缓存位置的**唯一权威**；HF/ollama/MS 的 scan 适配器改读它，
+让 `sources.<key>.cache_path` 成为缓存位置的**唯一权威**；**已有适配器（HF/Ollama）的 scan 改读它**，
 而非现在硬编码的 `engines.<key>.model_dir` 相对路径（这正是「aim 找错位置」的根因）。`engines` 保留给 provision/link 侧。
 迁移时为旧 config 提供向后兼容默认（无 `sources` 段时由 `engines` + 检测推导生成）。
+
+> **SP1/SP2 边界（实现期确认）**：SP1 检测并记录**所有 7 个源**的 `cache_path`，但只有 **HF/Ollama 这两个已有适配器**会在 `scan` 时读取它。
+> **ModelScope / PyTorch-Hub / Civitai / Git 没有 scan 适配器**（MS 当前是 download-only，其 `flat-ms` 缓存布局的扫描/摄取属 SP2）。
+> 因此 §11.1 验收中「`aim scan` 扫到模型」在 SP1 落地为 **HF（+Ollama）**；MS 等源的 `cache_path` 已被检测记录，等 SP2 的 `ModelScopeAdapter` 等落地后即可扫到。
 
 ---
 
