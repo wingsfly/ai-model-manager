@@ -3931,6 +3931,18 @@ def _hf_read_native(repo_dir: Path) -> dict:
     return {"repo_id": repo_id, "commit": commit, "files": files}
 
 
+def _ingest_to_store(files: list, dest: Path) -> int:
+    """Copy each real file flat into dest/<name>. Returns total bytes. No CAS structure copied."""
+    dest.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for f in files:
+        target = dest / f["name"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f["real_path"], target)
+        total += target.stat().st_size
+    return total
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}

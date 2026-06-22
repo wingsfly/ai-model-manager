@@ -42,5 +42,30 @@ class HFReadNativeTests(unittest.TestCase):
         self.assertEqual(Path(weights["real_path"]).read_bytes(), b"WEIGHTS")
 
 
+class IngestToStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+
+    def test_copies_flat_no_doubling(self):
+        src = self.home / "src"
+        _write(src / "config.json", b'{"a":1}')
+        _write(src / "model.safetensors", b"W" * 100)
+        files = [{"name": "config.json", "real_path": str(src / "config.json"), "size": 7},
+                 {"name": "model.safetensors", "real_path": str(src / "model.safetensors"), "size": 100}]
+        dest = self.home / "store" / "asr" / "model" / "m1"
+        total = aim._ingest_to_store(files, dest)
+        self.assertEqual(total, 107)
+        self.assertEqual((dest / "model.safetensors").read_bytes(), b"W" * 100)
+        self.assertEqual(sorted(p.name for p in dest.iterdir()), ["config.json", "model.safetensors"])
+
+    def test_nested_name_preserved(self):
+        src = self.home / "src"
+        _write(src / "sub" / "f.bin", b"z")
+        files = [{"name": "sub/f.bin", "real_path": str(src / "sub" / "f.bin"), "size": 1}]
+        dest = self.home / "store" / "x"
+        aim._ingest_to_store(files, dest)
+        self.assertTrue((dest / "sub" / "f.bin").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
