@@ -4055,6 +4055,61 @@ def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
             backup.unlink()
 
 
+def _ollama_models_root(manifest_path: Path) -> Path:
+    """Given .../manifests/<reg>/<ns>/<model>/<tag>, return the dir containing manifests/ and blobs/."""
+    p = manifest_path
+    while p.parent != p and p.name != "manifests":
+        p = p.parent
+    return p.parent
+
+
+def _ollama_read_native(manifest_path: Path, models_root: Path) -> dict:
+    """Parse an ollama manifest into {model, tag, manifest, gguf:{digest,real_path,size}, small_blobs, manifest_rel}."""
+    manifest = json.loads(manifest_path.read_text())
+    blobs_dir = models_root / "blobs"
+    layers = list(manifest.get("layers", []))
+    cfg = manifest.get("config")
+    gguf_layer = max(layers, key=lambda l: l.get("size", 0)) if layers else None
+    small = [l for l in layers if l is not gguf_layer]
+    if cfg:
+        small.append(cfg)
+    rel = manifest_path.relative_to(models_root / "manifests")
+    parts = rel.parts
+    model = parts[-2] if len(parts) >= 2 else manifest_path.parent.name
+    tag = parts[-1]
+    return {
+        "model": model, "tag": tag, "manifest": manifest, "manifest_rel": str(rel),
+        "gguf": {"digest": gguf_layer["digest"], "real_path": str(blobs_dir / gguf_layer["digest"]),
+                 "size": gguf_layer.get("size", 0)} if gguf_layer else None,
+        "small_blobs": [{"digest": b["digest"], "real_path": str(blobs_dir / b["digest"]),
+                         "size": b.get("size", 0)} for b in small],
+    }
+
+
+def _ollama_build_shim(info: dict, store_dir: Path, models_root: Path) -> None:
+    """Rebuild a MISSING ollama cache from store (verify --fix / restore direction):
+    hardlink the GGUF blob from store, copy small blobs, write the manifest."""
+    blobs_dir = models_root / "blobs"
+    blobs_dir.mkdir(parents=True, exist_ok=True)
+    store_gguf = store_dir / f"{store_dir.name}.gguf"
+    gguf_blob = blobs_dir / info["gguf"]["digest"]
+    if gguf_blob.exists() or gguf_blob.is_symlink():
+        gguf_blob.unlink()
+    if LinkManager.same_volume(store_gguf, gguf_blob):
+        os.link(store_gguf, gguf_blob)
+    else:
+        shutil.copy2(store_gguf, gguf_blob)
+    for b in info["small_blobs"]:
+        sb = blobs_dir / b["digest"]
+        if not sb.exists():
+            src = store_dir / f"blob-{b['digest']}"
+            if src.exists():
+                shutil.copy2(src, sb)
+    man_path = models_root / "manifests" / Path(info["manifest_rel"])
+    man_path.parent.mkdir(parents=True, exist_ok=True)
+    man_path.write_text(json.dumps(info["manifest"]))
+
+
 def _sanitize_ingest_id(entry: "ModelEntry", new_id: str) -> str:
     return _sanitize_model_id(new_id) if new_id else entry.id
 
@@ -4155,6 +4210,61 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
                 "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
                 "cache_root_var": "MODELSCOPE_CACHE",
                 "reconstruct": {"repo_id": entry.source.get("repo_id", ""), "dir_name": info["dir_name"]},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
+    if tool == "ollama":
+        models_root = _ollama_models_root(cache_repo)
+        info = _ollama_read_native(cache_repo, models_root)
+        if not info["gguf"]:
+            print(f"Error: no GGUF layer in {model_id}", file=sys.stderr)
+            return False
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "llm/chat"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} (gguf {info['gguf']['size']}B) -> {store_rel}, "
+                  f"hardlink blob into store (ollama cache left intact)")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            store_dir.mkdir(parents=True, exist_ok=True)
+            store_gguf = store_dir / f"{target_id}.gguf"
+            gguf_blob = Path(info["gguf"]["real_path"])
+            if LinkManager.same_volume(gguf_blob, store_gguf):
+                os.link(gguf_blob, store_gguf)        # share inode; cache blob untouched
+            else:
+                shutil.copy2(gguf_blob, store_gguf)
+            for b in info["small_blobs"]:
+                shutil.copy2(b["real_path"], store_dir / f"blob-{b['digest']}")
+            (store_dir / "manifest.json").write_text(json.dumps(info["manifest"]))
+            size = sum(p.stat().st_size for p in store_dir.rglob("*") if p.is_file())
+        except OSError as ex:
+            shutil.rmtree(store_dir, ignore_errors=True)   # safe: ollama cache untouched
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.format = "gguf"
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": "managed-ollama", "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": "ollama", "kind": "ollama-cas", "location": info["manifest_rel"],
+                "cache_root_var": "OLLAMA_MODELS",
+                "reconstruct": {"model": info["model"], "tag": info["tag"], "manifest": info["manifest"],
+                                "gguf_digest": info["gguf"]["digest"],
+                                "small_blobs": [b["digest"] for b in info["small_blobs"]]},
             }],
         }
         registry.add(entry)
