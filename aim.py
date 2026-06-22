@@ -1702,6 +1702,39 @@ class ServiceEnv:
         return [f"# set OLLAMA_MODELS={models_path} in your service manager"]
 
 
+def op_env_show(config: dict, detector: Optional["EnvDetector"] = None,
+                json_output: bool = False) -> int:
+    det = detector or EnvDetector()
+    rows = det.report()
+    cache_dirs = {k: str(det.cache_dir(k) or "") for k in SOURCES}
+    if json_output:
+        print(json.dumps({"env": rows, "cache_dirs": cache_dirs}, ensure_ascii=False))
+        return 0
+    print(f"{'SOURCE':<13}{'VARIABLE':<28}{'STATUS':<10}VALUE  [ORIGIN]")
+    for r in rows:
+        val = SecretStore.mask(r["effective_value"]) if r["secret"] else r["effective_value"]
+        print(f"{r['source_key']:<13}{r['name']:<28}{r['status']:<10}{val}  [{r['source']}]")
+    print()
+    print("Resolved cache directories:")
+    for k, v in cache_dirs.items():
+        if v:
+            print(f"  {k:<13} {v}")
+    return 0
+
+
+def op_env_path(config: dict, source: str, detector: Optional["EnvDetector"] = None) -> int:
+    det = detector or EnvDetector()
+    if source not in SOURCES:
+        print(f"Unknown source: {source}. Known: {', '.join(SOURCES)}", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    cd = det.cache_dir(source)
+    if cd is None:
+        print(f"Source '{source}' has no cache directory.", file=sys.stderr)
+        return EXIT_FAILED
+    print(str(cd))
+    return 0
+
+
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
     cfg = config.get("download", {})
     return DownloadOptions(
@@ -4061,6 +4094,19 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_sub = p_cfg.add_subparsers(dest="config_command")
     cfg_sub.add_parser("show", help="Show current configuration")
 
+    # env
+    p_env = sub.add_parser("env", help="Detect/manage download-source environment variables")
+    env_sub = p_env.add_subparsers(dest="env_command")
+    pe = env_sub.add_parser("show", help="Show detected env vars and cache dirs")
+    pe.add_argument("--json", dest="json_output", action="store_true")
+    pe = env_sub.add_parser("apply", help="Write aim env files and wire shell rc")
+    pe.add_argument("--shell", default="", help="zsh|bash|fish|all (default: detected)")
+    pe.add_argument("--set", dest="set_vars", action="append", default=[], metavar="VAR=VALUE")
+    pe.add_argument("--service", action="store_true", help="Also emit daemon-level env commands")
+    pe.add_argument("--dry-run", dest="dry_run", action="store_true")
+    pe = env_sub.add_parser("path", help="Print resolved cache dir for a source")
+    pe.add_argument("source", help="Source key, e.g. huggingface")
+
     return parser
 
 
@@ -4285,6 +4331,16 @@ def main() -> int:
         # No args = dry-run preview; --all = execute all
         dry_run = args.dry_run or (not args.organize_all and not args.model_id)
         op_organize(config, registry, model_id=args.model_id, dry_run=dry_run)
+
+    elif cmd == "env":
+        sub_cmd = getattr(args, "env_command", None)
+        if sub_cmd == "path":
+            return op_env_path(config, args.source)
+        elif sub_cmd == "apply":
+            return op_env_apply(config, registry, shell=args.shell, set_vars=args.set_vars,
+                                service=args.service, dry_run=args.dry_run)
+        else:
+            return op_env_show(config, json_output=getattr(args, "json_output", False))
 
     elif cmd == "config":
         if args.config_command == "show":
