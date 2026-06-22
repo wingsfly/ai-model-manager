@@ -317,6 +317,36 @@ aim config show    # 输出当前 config.json
 
 ---
 
+### aim env — 检测/管理下载源环境变量
+
+aim 能检测各下载源(HuggingFace/Ollama/ModelScope/PyTorch Hub/Civitai/Git)的环境变量配置——读 shell 启动文件、登录 shell 回显、或工具命令——并以「aim 独占 env 文件 + rc 仅加一行受 marker 保护的 source」的方式管理。
+
+```bash
+aim env show              # 检测并展示各源变量(当前值/来源/状态)+ 解析出的缓存目录(只读)
+aim env show --json       # 机器可读;secret 值已脱敏
+aim env path huggingface  # 打印某源解析后的缓存目录(脚本用)
+aim env apply --shell zsh # 写 ~/.aim/env.{sh,fish},并在 rc 插入一行受 marker 保护的 source
+aim env apply --set HF_ENDPOINT=https://hf-mirror.com --set HF_HUB_ENABLE_HF_TRANSFER=1
+aim env apply --dry-run   # 预览,不写任何文件
+aim env apply --service   # 额外打印 ollama 等服务级 env 设置命令(launchctl/systemd)
+```
+
+**说明:**
+- 检测会把各源真实缓存位置写回 `~/.aim/config.json` 的 `sources.<源>.cache_path`,使 `aim scan` 即使在 HF/MS 缓存位于默认 `~/.cache` 时也能扫到模型。
+- secret(如 `HF_TOKEN`/`CIVITAI_API_TOKEN`)不会写入 env 文件或 rc;优先用工具原生机制,兜底写入 `~/.aim/secrets.env`(权限 600)。
+- 缓存目录的「搬迁」不在此命令范围(属后续阶段);本命令默认采纳现状,只主动管理 endpoint/加速等安全变量。
+- 跨 shell:zsh/bash/fish 分别生成对应格式并接线到对应启动文件;改动前自动备份 `<rc>.aim.bak`。
+
+### aim sources — 下载源与工具
+
+```bash
+aim sources list                      # 列出所有源、其下载工具安装状态、env 概览
+aim sources list --json
+aim sources install huggingface -y    # 安装该源的下载工具(复用后台工具自动安装)
+```
+
+---
+
 ## 全局选项
 
 ```bash
