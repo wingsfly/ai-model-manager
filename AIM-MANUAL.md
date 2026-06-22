@@ -161,8 +161,6 @@ aim download ms:Qwen/Qwen2-7B --category llm/chat
 
 ---
 
----
-
 ### aim ingest — 原生模型摇入 store
 
 把 HuggingFace / Ollama / ModelScope 的原生缓存模型「摇入」`store/{类别}/{id}/` 扁平单目录，并在工具原缓存位置重建「加载壳」指回 store，使工具仍能原生加载；同时在 registry 写入 `storage` 标注（供备份/还原与 `aim verify --fix` 重建壳）。**取代旧的 `aim convert`**（旧实现会把缓存复制成 CAS 结构、体积翻倍且工具无法加载）。

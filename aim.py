@@ -1060,7 +1060,7 @@ class ModelScopeAdapter(EngineAdapter):
                 for repo_dir in sorted(org_dir.iterdir()):
                     if repo_dir.is_symlink() or not repo_dir.is_dir() or repo_dir.name.startswith((".", "_")):
                         continue
-                    if not any(f.is_file() for f in repo_dir.rglob("*")):
+                    if not any(f.is_file() and not f.name.startswith(".") for f in repo_dir.rglob("*")):
                         continue
                     repo_name = repo_dir.name.replace("___", ".")
                     repo_id = f"{org_dir.name}/{repo_name}"

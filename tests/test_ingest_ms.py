@@ -56,6 +56,14 @@ class ModelScopeAdapterTests(unittest.TestCase):
         repo_ids = [s.source["repo_id"] for s in ad.scan()]
         self.assertNotIn("Org/M", repo_ids)
 
+    def test_scan_skips_metadata_only_dirs(self):
+        base = self.cache / "models" / "funasr" / "paraformer-zh"
+        _write(base / ".mdl", b"meta")
+        _write(base / ".msc", b"meta")
+        ad = aim.ModelScopeAdapter(self.config, self.root)
+        repo_ids = [s.source["repo_id"] for s in ad.scan()]
+        self.assertNotIn("funasr/paraformer-zh", repo_ids)
+
 
 class MSIngestTests(unittest.TestCase):
     def setUp(self):
