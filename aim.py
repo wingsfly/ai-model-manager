@@ -1803,6 +1803,45 @@ def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
     return 0
 
 
+def op_sources_list(config: dict, detector: Optional["EnvDetector"] = None,
+                    json_output: bool = False) -> int:
+    det = detector or EnvDetector()
+    out = []
+    for key, spec in SOURCES.items():
+        tools = [{"name": t["name"], "installed": _check_backend_available(t, config)}
+                 for t in spec.get("tools", [])]
+        out.append({
+            "key": key,
+            "cache_layout": spec.get("cache_layout"),
+            "cache_dir": str(det.cache_dir(key) or ""),
+            "tools": tools,
+            "env_vars": [e["name"] for e in spec.get("env", [])],
+        })
+    if json_output:
+        print(json.dumps({"sources": out}, ensure_ascii=False))
+        return 0
+    for s in out:
+        tool_str = ", ".join(f"{t['name']}{'✓' if t['installed'] else '✗'}" for t in s["tools"])
+        print(f"{s['key']:<13} layout={s['cache_layout']:<10} tools=[{tool_str}]")
+        if s["cache_dir"]:
+            print(f"              cache: {s['cache_dir']}")
+    return 0
+
+
+def op_sources_install(config: dict, source: str, json_output: bool = False,
+                       auto_confirm: bool = False) -> int:
+    if source not in SOURCES:
+        print(f"Unknown source: {source}. Known: {', '.join(SOURCES)}", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    ok, err = _ensure_backend(source, config, json_output, auto_confirm)
+    if not ok:
+        if err:
+            print(err)
+        return EXIT_BACKEND_MISSING
+    print(f"Source '{source}' has at least one usable tool.")
+    return 0
+
+
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
     cfg = config.get("download", {})
     return DownloadOptions(
@@ -4175,6 +4214,16 @@ def build_parser() -> argparse.ArgumentParser:
     pe = env_sub.add_parser("path", help="Print resolved cache dir for a source")
     pe.add_argument("source", help="Source key, e.g. huggingface")
 
+    # sources
+    p_src = sub.add_parser("sources", help="List/manage download sources and their tools")
+    src_sub = p_src.add_subparsers(dest="sources_command")
+    ps = src_sub.add_parser("list", help="List sources, tool install state, env summary")
+    ps.add_argument("--json", dest="json_output", action="store_true")
+    ps = src_sub.add_parser("install", help="Install a download tool for a source")
+    ps.add_argument("source", help="Source key, e.g. huggingface")
+    ps.add_argument("-y", "--yes", dest="auto_confirm", action="store_true")
+    ps.add_argument("--json", dest="json_output", action="store_true")
+
     return parser
 
 
@@ -4409,6 +4458,14 @@ def main() -> int:
                                 service=args.service, dry_run=args.dry_run)
         else:
             return op_env_show(config, json_output=getattr(args, "json_output", False))
+
+    elif cmd == "sources":
+        sub_cmd = getattr(args, "sources_command", None)
+        if sub_cmd == "install":
+            return op_sources_install(config, args.source,
+                                      json_output=getattr(args, "json_output", False),
+                                      auto_confirm=getattr(args, "auto_confirm", False))
+        return op_sources_list(config, json_output=getattr(args, "json_output", False))
 
     elif cmd == "config":
         if args.config_command == "show":

@@ -83,5 +83,23 @@ class EnvApplyTests(unittest.TestCase):
         self.assertEqual(rc.read_text(), "orig\n")
 
 
+class SourcesCliTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+
+    def test_sources_list_json(self):
+        cfg = aim.default_config()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = aim.op_sources_list(cfg, detector=_detector(self.home), json_output=True)
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        keys = {s["key"] for s in data["sources"]}
+        self.assertEqual(keys, set(aim.SOURCES))
+        hf = next(s for s in data["sources"] if s["key"] == "huggingface")
+        self.assertIn("tools", hf)
+        self.assertIn("cache_dir", hf)
+
+
 if __name__ == "__main__":
     unittest.main()
