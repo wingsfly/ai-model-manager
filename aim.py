@@ -3357,10 +3357,11 @@ def op_convert_native_to_store(
     new_id: str = "",
     category: str = "",
     mode: str = "copy",
-    keep_native: bool = False,
+    keep_native: bool = True,
     json_output: bool = False,
 ) -> bool:
-    """Deprecated: delegates to op_ingest (correct flat ingest + shim + annotation)."""
+    """Deprecated: delegates to op_ingest (correct flat ingest + shim + annotation).
+    The `mode` parameter is ignored (ingest always copies/hard-links flat)."""
     if not json_output:
         print("Note: 'aim convert' is deprecated; use 'aim ingest'. Delegating to ingest...")
     return op_ingest(config, registry, model_id, new_id=new_id, category=category,

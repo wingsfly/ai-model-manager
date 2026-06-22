@@ -59,7 +59,7 @@ class ConvertDelegationTests(unittest.TestCase):
                       category="asr/model", canonical={"root": "primary", "path": str(repo_dir)})]
         buf = io.StringIO()
         with redirect_stdout(buf):
-            ok = aim.op_convert_native_to_store(cfg, reg, "hf-org-model", json_output=False)
+            ok = aim.op_convert_native_to_store(cfg, reg, "hf-org-model", keep_native=False, json_output=False)
         self.assertTrue(ok)
         e = reg.find("hf-org-model")
         self.assertEqual(e.storage["class"], "managed-hf")
