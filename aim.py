@@ -1532,6 +1532,29 @@ class EnvDetector:
                 "source": source, "aim_recommended": recommended, "status": status,
                 "secret": entry.get("secret", False)}
 
+    def cache_dir(self, key: str) -> Optional[Path]:
+        spec = self.sources.get(key, {})
+        env = spec.get("env", [])
+        override = next((e for e in env if e.get("role") == "cache_dir_override"), None)
+        if override:
+            r = self.resolve(key, override)
+            if r["status"] != "unset" and r["effective_value"]:
+                return Path(self.expand(r["effective_value"]))
+        base = next((e for e in env if e.get("role") == "cache_dir"), None)
+        if not base:
+            return None
+        r = self.resolve(key, base)
+        root = Path(self.expand(r["effective_value"]))
+        sub = base.get("subpath", "")
+        return root / sub if sub else root
+
+    def report(self) -> list[dict]:
+        rows: list[dict] = []
+        for key, spec in self.sources.items():
+            for entry in spec.get("env", []):
+                rows.append({"source": key, **self.resolve(key, entry)})
+        return rows
+
 
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
     cfg = config.get("download", {})

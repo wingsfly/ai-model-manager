@@ -79,5 +79,29 @@ class EnvDetectorParsingTests(unittest.TestCase):
         self.assertNotEqual(r["status"], "conflict")
 
 
+class EnvDetectorCacheDirTests(unittest.TestCase):
+    def test_cache_dir_uses_subpath(self):
+        d = aim.EnvDetector(home=Path("/h"), rc_files=[],
+                            shell_value=lambda v: "/data/hf" if v == "HF_HOME" else None)
+        self.assertEqual(d.cache_dir("huggingface"), Path("/data/hf/hub"))
+
+    def test_cache_dir_override_wins(self):
+        vals = {"HF_HOME": "/data/hf", "HF_HUB_CACHE": "/fast/hub"}
+        d = aim.EnvDetector(home=Path("/h"), rc_files=[], shell_value=lambda v: vals.get(v))
+        self.assertEqual(d.cache_dir("huggingface"), Path("/fast/hub"))
+
+    def test_cache_dir_default_when_unset(self):
+        d = aim.EnvDetector(home=Path("/h"), rc_files=[], shell_value=lambda v: None)
+        self.assertEqual(d.cache_dir("huggingface"), Path("/h/.cache/huggingface/hub"))
+
+    def test_report_covers_all_env_entries(self):
+        d = aim.EnvDetector(home=Path("/h"), rc_files=[], shell_value=lambda v: None)
+        rows = d.report()
+        names = {r["name"] for r in rows}
+        self.assertIn("HF_HOME", names)
+        self.assertIn("TORCH_HOME", names)
+        self.assertIn("MODELSCOPE_CACHE", names)
+
+
 if __name__ == "__main__":
     unittest.main()
