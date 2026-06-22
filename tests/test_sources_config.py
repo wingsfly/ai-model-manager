@@ -68,7 +68,7 @@ class ScanAutoAlignTests(unittest.TestCase):
         orig = aim._sync_sources_cache_paths
         def spy(c, d):
             called["n"] += 1
-            return orig(c, d)
+            return c
         aim._sync_sources_cache_paths = spy
         try:
             reg = aim.Registry()

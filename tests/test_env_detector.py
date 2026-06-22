@@ -111,5 +111,28 @@ class EnvDetectorCacheDirTests(unittest.TestCase):
         self.assertEqual(hf_home["source"], "env")              # resolution origin
 
 
+class EnvDetectorShellCacheTests(unittest.TestCase):
+    def test_login_env_spawned_once_and_cached(self):
+        calls = {"n": 0}
+
+        class FakeResult:
+            stdout = "HF_HOME=/x/hf\nTORCH_HOME=/x/torch\n"
+
+        def fake_run(*a, **k):
+            calls["n"] += 1
+            return FakeResult()
+
+        orig = aim.subprocess.run
+        aim.subprocess.run = fake_run
+        try:
+            d = aim.EnvDetector(home=Path("/h"), rc_files=[])  # no shell_value → real path, faked subprocess
+            self.assertEqual(d.login_shell_value("HF_HOME"), "/x/hf")
+            self.assertEqual(d.login_shell_value("TORCH_HOME"), "/x/torch")
+            self.assertIsNone(d.login_shell_value("NOPE"))
+            self.assertEqual(calls["n"], 1)  # spawned once, then cached
+        finally:
+            aim.subprocess.run = orig
+
+
 if __name__ == "__main__":
     unittest.main()

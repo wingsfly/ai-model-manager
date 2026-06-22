@@ -1448,6 +1448,7 @@ class EnvDetector:
         self._shell_value = shell_value      # callable(var)->Optional[str]
         self._tool_probe = tool_probe        # callable(var, entry)->Optional[str]
         self._recommended = recommended_map or {}
+        self._login_env_cache: Optional[dict] = None
 
     def rc_files(self) -> list[Path]:
         if self._rc_files is not None:
@@ -1493,20 +1494,32 @@ class EnvDetector:
                     val = val.split(sep, 1)[0].rstrip()
         return val.strip('"').strip("'")
 
+    def _get_login_env(self) -> dict:
+        """Spawn the login shell ONCE and capture its full environment (cached)."""
+        if self._login_env_cache is not None:
+            return self._login_env_cache
+        shell = os.environ.get("SHELL", "/bin/sh")
+        base = os.path.basename(shell)
+        env: dict = {}
+        try:
+            if base == "fish":
+                cmd = [shell, "-c", "env"]
+            else:
+                cmd = [shell, "-lic", "env"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                k, sep, v = line.partition("=")
+                if sep and k:
+                    env[k] = v
+        except (OSError, subprocess.SubprocessError):
+            env = {}
+        self._login_env_cache = env
+        return env
+
     def login_shell_value(self, var: str) -> Optional[str]:
         if self._shell_value is not None:
             return self._shell_value(var)
-        shell = os.environ.get("SHELL", "/bin/sh")
-        base = os.path.basename(shell)
-        try:
-            if base == "fish":
-                cmd = [shell, "-c", f"echo ${var}"]
-            else:
-                cmd = [shell, "-lic", f'printf "%s" "${var}"']
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            return r.stdout.strip() or None
-        except (OSError, subprocess.SubprocessError):
-            return None
+        return self._get_login_env().get(var) or None
 
     def resolve(self, key: str, entry: dict) -> dict:
         var = entry["name"]
