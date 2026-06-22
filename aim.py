@@ -1554,12 +1554,16 @@ class EnvDetector:
         rows: list[dict] = []
         for key, spec in self.sources.items():
             for entry in spec.get("env", []):
-                rows.append({"source": key, **self.resolve(key, entry)})
+                # source_key = which SOURCES entry this belongs to;
+                # resolve()'s "source" = where the value came from (env/rc/tool/default)
+                rows.append({"source_key": key, **self.resolve(key, entry)})
         return rows
 
 
 def _sync_sources_cache_paths(config: dict, detector: "EnvDetector") -> dict:
-    """Write each source's detected cache location into config['sources'][k]['cache_path']."""
+    """Re-derive each source's cache location from live detection into
+    config['sources'][k]['cache_path']. cache_path is ALWAYS recomputed (it mirrors
+    where the tool currently caches); other keys (e.g. managed_env) are preserved."""
     sources = config.setdefault("sources", {})
     for key in SOURCES:
         cd = detector.cache_dir(key)

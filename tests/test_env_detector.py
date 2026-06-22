@@ -102,6 +102,14 @@ class EnvDetectorCacheDirTests(unittest.TestCase):
         self.assertIn("TORCH_HOME", names)
         self.assertIn("MODELSCOPE_CACHE", names)
 
+    def test_report_row_has_source_key_and_origin(self):
+        d = aim.EnvDetector(home=Path("/h"), rc_files=[],
+                            shell_value=lambda v: "/data/hf" if v == "HF_HOME" else None)
+        rows = d.report()
+        hf_home = next(r for r in rows if r["name"] == "HF_HOME")
+        self.assertEqual(hf_home["source_key"], "huggingface")  # which source
+        self.assertEqual(hf_home["source"], "env")              # resolution origin
+
 
 if __name__ == "__main__":
     unittest.main()
