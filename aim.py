@@ -1257,13 +1257,13 @@ SOURCES: dict[str, dict] = {
             {"name": "HF_HUB_CACHE", "role": "cache_dir_override", "default": "",
              "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
             {"name": "HF_ENDPOINT", "role": "endpoint", "default": "https://huggingface.co",
-             "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
             {"name": "HF_TOKEN", "role": "token", "default": "",
-             "detect": ["env", "tool"], "manage": "native", "secret": True},
+             "subpath": "", "detect": ["env", "tool"], "manage": "native", "secret": True},
             {"name": "HF_HUB_ENABLE_HF_TRANSFER", "role": "accel", "default": "0",
-             "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
             {"name": "HF_XET_CACHE", "role": "regen_cache", "default": "",
-             "detect": ["env", "rc"], "manage": "none", "secret": False},
+             "subpath": "", "detect": ["env", "rc"], "manage": "none", "secret": False},
         ],
     },
     "ollama": {
@@ -1277,7 +1277,7 @@ SOURCES: dict[str, dict] = {
             {"name": "OLLAMA_MODELS", "role": "cache_dir", "default": "~/.ollama/models",
              "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
             {"name": "OLLAMA_HOST", "role": "endpoint", "default": "127.0.0.1:11434",
-             "detect": ["env", "rc"], "manage": "service", "secret": False},
+             "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
         ],
     },
     "modelscope": {
@@ -1324,7 +1324,7 @@ SOURCES: dict[str, dict] = {
         ],
         "env": [
             {"name": "CIVITAI_API_TOKEN", "role": "token", "default": "",
-             "detect": ["env"], "manage": "native", "secret": True},
+             "subpath": "", "detect": ["env"], "manage": "native", "secret": True},
         ],
     },
     "git": {
@@ -1338,9 +1338,13 @@ SOURCES: dict[str, dict] = {
     },
 }
 
-# Derived backward-compat view: existing download code reads _BACKEND_REGISTRY[type] -> [tool,...]
+# Backward-compat install view: maps source type -> [tool, ...] for _ensure_backend.
+# Derived from SOURCES (no tool-list duplication). The `if spec["tools"]` filter omits
+# any future tool-less source. pytorch-hub/civitai/git are included so their install
+# backends are ready when download handlers land; _ensure_backend is only reached for
+# source types parseable by _parse_download_source, so the extra keys never misfire today.
 _BACKEND_REGISTRY: dict[str, list[dict]] = {
-    key: spec["tools"] for key, spec in SOURCES.items() if spec.get("tools")
+    key: spec["tools"] for key, spec in SOURCES.items() if spec["tools"]
 }
 
 

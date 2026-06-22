@@ -30,6 +30,12 @@ class SourcesRegistryTests(unittest.TestCase):
                 self.assertIn("check", t)
                 self.assertIn("install_cmd", t)
 
+    def test_all_sources_tool_shape(self):
+        for key, spec in aim.SOURCES.items():
+            for t in spec["tools"]:
+                for field in ("name", "check", "install_cmd", "description"):
+                    self.assertIn(field, t, f"{key}:{t.get('name','?')} missing {field}")
+
 
 if __name__ == "__main__":
     unittest.main()
