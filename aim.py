@@ -1425,6 +1425,101 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
     return False, ""
 
 
+# ── Sources & Env (SP1) ──────────────────────────────────────────────────────
+
+
+class EnvDetector:
+    """Read-only resolver for source env vars across shells/tools."""
+
+    def __init__(self, sources: Optional[dict] = None, home: Optional[Path] = None,
+                 rc_files: Optional[list] = None, shell_value=None, tool_probe=None,
+                 recommended_map: Optional[dict] = None):
+        self.sources = sources if sources is not None else SOURCES
+        self.home = Path(home) if home else Path.home()
+        self._rc_files = rc_files            # None -> auto-discover; [] -> none
+        self._shell_value = shell_value      # callable(var)->Optional[str]
+        self._tool_probe = tool_probe        # callable(var, entry)->Optional[str]
+        self._recommended = recommended_map or {}
+
+    def rc_files(self) -> list[Path]:
+        if self._rc_files is not None:
+            return [Path(p) for p in self._rc_files]
+        names = [".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"]
+        out = [self.home / n for n in names]
+        out.append(self.home / ".config" / "fish" / "config.fish")
+        return [p for p in out if p.exists()]
+
+    def expand(self, val: str) -> str:
+        if not val:
+            return val
+        if val.startswith("~/") or val == "~":
+            return str(self.home / val[2:]) if val.startswith("~/") else str(self.home)
+        return os.path.expanduser(val)
+
+    def scan_rc(self, var: str) -> list[tuple[str, str]]:
+        pat_sh = re.compile(r'^\s*(?:export\s+)?' + re.escape(var) + r'=(.+)$')
+        pat_fish = re.compile(r'^\s*set\s+(?:-\S+\s+)*' + re.escape(var) + r'\s+(.+)$')
+        found: list[tuple[str, str]] = []
+        for f in self.rc_files():
+            try:
+                for line in f.read_text().splitlines():
+                    if line.strip().startswith("#"):
+                        continue
+                    m = pat_sh.match(line) or pat_fish.match(line)
+                    if m:
+                        found.append((str(f), m.group(1).strip().strip('"').strip("'")))
+            except OSError:
+                continue
+        return found
+
+    def login_shell_value(self, var: str) -> Optional[str]:
+        if self._shell_value is not None:
+            return self._shell_value(var)
+        shell = os.environ.get("SHELL", "/bin/sh")
+        base = os.path.basename(shell)
+        try:
+            if base == "fish":
+                cmd = [shell, "-c", f"echo ${var}"]
+            else:
+                cmd = [shell, "-ic", f'printf "%s" "${var}"']
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def resolve(self, key: str, entry: dict) -> dict:
+        var = entry["name"]
+        detect = entry.get("detect", ["env"])
+        rc_hits = self.scan_rc(var) if "rc" in detect else []
+        rc_values = {v for _, v in rc_hits}
+        effective: Optional[str] = None
+        source = "default"
+        if "env" in detect:
+            live = self.login_shell_value(var)
+            if live:
+                effective, source = live, "env"
+        if effective is None and rc_hits:
+            effective, source = rc_hits[0][1], f"rc:{rc_hits[0][0]}"
+        if effective is None and "tool" in detect and self._tool_probe:
+            tv = self._tool_probe(var, entry)
+            if tv:
+                effective, source = tv, "tool"
+        recommended = self._recommended.get(var, "")
+        if effective is None:
+            status = "unset"
+            effective = self.expand(entry.get("default", "")) or ""
+            source = "default"
+        elif len(rc_values) > 1:
+            status = "conflict"
+        elif recommended and effective != recommended:
+            status = "drift"
+        else:
+            status = "ok"
+        return {"name": var, "role": entry.get("role", "misc"), "effective_value": effective,
+                "source": source, "aim_recommended": recommended, "status": status,
+                "secret": entry.get("secret", False)}
+
+
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
     cfg = config.get("download", {})
     return DownloadOptions(
