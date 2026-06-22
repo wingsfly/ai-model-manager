@@ -41,6 +41,14 @@ class HFReadNativeTests(unittest.TestCase):
         weights = next(f for f in info["files"] if f["name"] == "model.safetensors")
         self.assertEqual(Path(weights["real_path"]).read_bytes(), b"WEIGHTS")
 
+    def test_read_native_fallback_when_no_refs(self):
+        repo_dir = make_hf_cache(self.home, commit="zzz999")
+        (repo_dir / "refs" / "main").unlink()  # force fallback
+        info = aim._hf_read_native(repo_dir)
+        self.assertEqual(info["commit"], "zzz999")               # recovered from snapshot dir name
+        names = sorted(f["name"] for f in info["files"])
+        self.assertEqual(names, ["config.json", "model.safetensors"])  # NOT hash-prefixed
+
 
 class IngestToStoreTests(unittest.TestCase):
     def setUp(self):
