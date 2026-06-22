@@ -208,6 +208,8 @@ def default_config() -> dict:
             "piper":       {"enabled": True, "model_dir": "piper"},
             "fish-speech": {"enabled": True, "model_dir": "services/fish-speech"},
         },
+        "sources": {},
+        "env": {"managed": False, "shells": [], "files": {}},
     }
 
 
@@ -403,9 +405,13 @@ class EngineAdapter:
         self.enabled = engine_cfg.get("enabled", True)
         self.model_dir = engine_cfg.get("model_dir", "")
         self.native_cas = engine_cfg.get("native_cas", False)
+        self._cache_path = config.get("sources", {}).get(self.name, {}).get("cache_path", "")
 
     @property
     def base_path(self) -> Path:
+        # Native-CAS engines (HF/Ollama): prefer the detected real cache location.
+        if self.native_cas and self._cache_path:
+            return Path(self._cache_path)
         return Path(self.root.path) / self.model_dir
 
     def scan(self) -> list[ScannedModel]:
@@ -1058,6 +1064,8 @@ def get_adapter(name: str, config: dict, root: StorageRoot) -> EngineAdapter:
 def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[ScannedModel]:
     """Scan engine directories and register discovered models."""
     root = get_primary_root(config)
+    # Align config to where tools actually cache models, so we scan the right dirs.
+    _sync_sources_cache_paths(config, EnvDetector())
     all_scanned: list[ScannedModel] = []
     engines = [engine_filter] if engine_filter else list(config.get("engines", {}).keys())
 
@@ -1239,51 +1247,112 @@ def _resolve_download_dest(root: StorageRoot, model_id: str, category: str, expl
     return root.store_path / final_category / model_id, "auto"
 
 
+SOURCES: dict[str, dict] = {
+    "huggingface": {
+        "aliases": ["hf"],
+        "cache_layout": "cas-hf",
+        "tools": [
+            {"name": "hfd", "check": "path",
+             "install_cmd": "curl -fSL -o {root}/hfd.sh https://hf-mirror.com/hfd/hfd.sh && chmod +x {root}/hfd.sh && brew install wget aria2",
+             "description": "HuggingFace Download script (hfd.sh + wget + aria2)"},
+            {"name": "hf", "check": "which",
+             "install_cmd": "pip3 install --break-system-packages -U huggingface_hub",
+             "description": "HuggingFace CLI (hf)"},
+        ],
+        "env": [
+            {"name": "HF_HOME", "role": "cache_dir", "default": "~/.cache/huggingface",
+             "subpath": "hub", "detect": ["env", "rc", "tool"], "manage": "env_file", "secret": False},
+            {"name": "HF_HUB_CACHE", "role": "cache_dir_override", "default": "",
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+            {"name": "HF_ENDPOINT", "role": "endpoint", "default": "https://huggingface.co",
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+            {"name": "HF_TOKEN", "role": "token", "default": "",
+             "subpath": "", "detect": ["env", "tool"], "manage": "native", "secret": True},
+            {"name": "HF_HUB_ENABLE_HF_TRANSFER", "role": "accel", "default": "0",
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+            {"name": "HF_XET_CACHE", "role": "regen_cache", "default": "",
+             "subpath": "", "detect": ["env", "rc"], "manage": "none", "secret": False},
+        ],
+    },
+    "ollama": {
+        "aliases": [],
+        "cache_layout": "cas-ollama",
+        "tools": [
+            {"name": "ollama", "check": "which", "install_cmd": "brew install ollama",
+             "description": "Ollama CLI"},
+        ],
+        "env": [
+            {"name": "OLLAMA_MODELS", "role": "cache_dir", "default": "~/.ollama/models",
+             "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
+            {"name": "OLLAMA_HOST", "role": "endpoint", "default": "127.0.0.1:11434",
+             "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
+        ],
+    },
+    "modelscope": {
+        "aliases": ["ms"],
+        "cache_layout": "flat-ms",
+        "tools": [
+            {"name": "modelscope", "check": "which",
+             "install_cmd": "pip3 install --break-system-packages modelscope",
+             "description": "ModelScope CLI"},
+        ],
+        "env": [
+            {"name": "MODELSCOPE_CACHE", "role": "cache_dir", "default": "~/.cache/modelscope",
+             "subpath": "", "detect": ["env", "rc"], "manage": "env_file", "secret": False},
+        ],
+    },
+    "url": {
+        "aliases": [],
+        "cache_layout": "flat",
+        "tools": [
+            {"name": "wget", "check": "which", "install_cmd": "brew install wget", "description": "GNU Wget"},
+            {"name": "curl", "check": "which", "install_cmd": "brew install curl", "description": "cURL"},
+        ],
+        "env": [],
+    },
+    "pytorch-hub": {
+        "aliases": ["torch", "pytorch"],
+        "cache_layout": "torch-hub",
+        "tools": [
+            {"name": "python3", "check": "which", "install_cmd": "brew install python",
+             "description": "Python (torch.hub)"},
+        ],
+        "env": [
+            {"name": "TORCH_HOME", "role": "cache_dir", "default": "~/.cache/torch",
+             "subpath": "hub", "detect": ["env", "rc", "tool"], "manage": "env_file", "secret": False},
+        ],
+    },
+    "civitai": {
+        "aliases": [],
+        "cache_layout": "flat",
+        "tools": [
+            {"name": "civitdl", "check": "which",
+             "install_cmd": "pip3 install --break-system-packages civitdl",
+             "description": "Civitai downloader (civitdl)"},
+        ],
+        "env": [
+            {"name": "CIVITAI_API_TOKEN", "role": "token", "default": "",
+             "subpath": "", "detect": ["env"], "manage": "native", "secret": True},
+        ],
+    },
+    "git": {
+        "aliases": ["git-lfs"],
+        "cache_layout": "flat",
+        "tools": [
+            {"name": "git", "check": "which", "install_cmd": "brew install git", "description": "Git"},
+            {"name": "git-lfs", "check": "which", "install_cmd": "brew install git-lfs", "description": "Git LFS"},
+        ],
+        "env": [],
+    },
+}
+
+# Backward-compat install view: maps source type -> [tool, ...] for _ensure_backend.
+# Derived from SOURCES (no tool-list duplication). The `if spec["tools"]` filter omits
+# any future tool-less source. pytorch-hub/civitai/git are included so their install
+# backends are ready when download handlers land; _ensure_backend is only reached for
+# source types parseable by _parse_download_source, so the extra keys never misfire today.
 _BACKEND_REGISTRY: dict[str, list[dict]] = {
-    "huggingface": [
-        {
-            "name": "hfd",
-            "check": "path",
-            "install_cmd": "curl -fSL -o {root}/hfd.sh https://hf-mirror.com/hfd/hfd.sh && chmod +x {root}/hfd.sh && brew install wget aria2",
-            "description": "HuggingFace Download script (hfd.sh + wget + aria2)",
-        },
-        {
-            "name": "hf",
-            "check": "which",
-            "install_cmd": "pip3 install --break-system-packages -U huggingface_hub",
-            "description": "HuggingFace CLI (hf)",
-        },
-    ],
-    "ollama": [
-        {
-            "name": "ollama",
-            "check": "which",
-            "install_cmd": "brew install ollama",
-            "description": "Ollama CLI",
-        },
-    ],
-    "modelscope": [
-        {
-            "name": "modelscope",
-            "check": "which",
-            "install_cmd": "pip3 install --break-system-packages modelscope",
-            "description": "ModelScope CLI",
-        },
-    ],
-    "url": [
-        {
-            "name": "wget",
-            "check": "which",
-            "install_cmd": "brew install wget",
-            "description": "GNU Wget",
-        },
-        {
-            "name": "curl",
-            "check": "which",
-            "install_cmd": "brew install curl",
-            "description": "cURL",
-        },
-    ],
+    key: spec["tools"] for key, spec in SOURCES.items() if spec["tools"]
 }
 
 
@@ -1362,6 +1431,466 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
         return False, err
     print(msg)
     return False, ""
+
+
+# ── Sources & Env (SP1) ──────────────────────────────────────────────────────
+
+
+class EnvDetector:
+    """Read-only resolver for source env vars across shells/tools."""
+
+    def __init__(self, sources: Optional[dict] = None, home: Optional[Path] = None,
+                 rc_files: Optional[list] = None, shell_value=None, tool_probe=None,
+                 recommended_map: Optional[dict] = None):
+        self.sources = sources if sources is not None else SOURCES
+        self.home = Path(home) if home else Path.home()
+        self._rc_files = rc_files            # None -> auto-discover; [] -> none
+        self._shell_value = shell_value      # callable(var)->Optional[str]
+        self._tool_probe = tool_probe        # callable(var, entry)->Optional[str]
+        self._recommended = recommended_map or {}
+        self._login_env_cache: Optional[dict] = None
+
+    def rc_files(self) -> list[Path]:
+        if self._rc_files is not None:
+            return [Path(p) for p in self._rc_files]
+        names = [".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"]
+        out = [self.home / n for n in names]
+        out.append(self.home / ".config" / "fish" / "config.fish")
+        return [p for p in out if p.exists()]
+
+    def expand(self, val: str) -> str:
+        if not val:
+            return val
+        if val.startswith("~/") or val == "~":
+            return str(self.home / val[2:]) if val.startswith("~/") else str(self.home)
+        return os.path.expanduser(val)
+
+    def scan_rc(self, var: str) -> list[tuple[str, str]]:
+        pat_sh = re.compile(r'^\s*(?:export\s+)?' + re.escape(var) + r'=(.+)$')
+        pat_fish = re.compile(r'^\s*set\s+((?:-\S+\s+)*)' + re.escape(var) + r'\s+(.+)$')
+        found: list[tuple[str, str]] = []
+        for f in self.rc_files():
+            try:
+                for line in f.read_text().splitlines():
+                    if line.strip().startswith("#"):
+                        continue
+                    m_sh = pat_sh.match(line)
+                    if m_sh:
+                        found.append((str(f), self._clean_value(m_sh.group(1))))
+                        continue
+                    m_fish = pat_fish.match(line)
+                    if m_fish and "x" in m_fish.group(1):  # only exported fish vars (-gx/-x/-Ux)
+                        found.append((str(f), self._clean_value(m_fish.group(2))))
+            except OSError:
+                continue
+        return found
+
+    @staticmethod
+    def _clean_value(raw: str) -> str:
+        val = raw.strip()
+        if val[:1] not in ('"', "'"):
+            for sep in (" #", "\t#"):
+                if sep in val:
+                    val = val.split(sep, 1)[0].rstrip()
+        return val.strip('"').strip("'")
+
+    def _get_login_env(self) -> dict:
+        """Spawn the login shell ONCE and capture its full environment (cached)."""
+        if self._login_env_cache is not None:
+            return self._login_env_cache
+        shell = os.environ.get("SHELL", "/bin/sh")
+        base = os.path.basename(shell)
+        env: dict = {}
+        try:
+            if base == "fish":
+                cmd = [shell, "-c", "env"]
+            else:
+                cmd = [shell, "-lic", "env"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                k, sep, v = line.partition("=")
+                if sep and k:
+                    env[k] = v
+        except (OSError, subprocess.SubprocessError):
+            env = {}
+        self._login_env_cache = env
+        return env
+
+    def login_shell_value(self, var: str) -> Optional[str]:
+        if self._shell_value is not None:
+            return self._shell_value(var)
+        return self._get_login_env().get(var) or None
+
+    def resolve(self, key: str, entry: dict) -> dict:
+        var = entry["name"]
+        detect = entry.get("detect", ["env"])
+        rc_hits = self.scan_rc(var) if "rc" in detect else []
+        rc_values = {v for _, v in rc_hits}
+        effective: Optional[str] = None
+        source = "default"
+        if "env" in detect:
+            live = self.login_shell_value(var)
+            if live:
+                effective, source = live, "env"
+        if effective is None and rc_hits:
+            effective, source = rc_hits[0][1], f"rc:{rc_hits[0][0]}"
+        if effective is None and "tool" in detect and self._tool_probe:
+            tv = self._tool_probe(var, entry)
+            if tv:
+                effective, source = tv, "tool"
+        recommended = self._recommended.get(var, "")
+        if effective is None:
+            status = "unset"
+            effective = self.expand(entry.get("default", "")) or ""
+            source = "default"
+        elif source.startswith("rc") and len(rc_values) > 1:
+            status = "conflict"
+        elif recommended and effective != recommended:
+            status = "drift"
+        else:
+            status = "ok"
+        return {"name": var, "role": entry.get("role", "misc"), "effective_value": effective,
+                "source": source, "aim_recommended": recommended, "status": status,
+                "secret": entry.get("secret", False)}
+
+    def cache_dir(self, key: str) -> Optional[Path]:
+        spec = self.sources.get(key, {})
+        env = spec.get("env", [])
+        override = next((e for e in env if e.get("role") == "cache_dir_override"), None)
+        if override:
+            r = self.resolve(key, override)
+            if r["status"] != "unset" and r["effective_value"]:
+                return Path(self.expand(r["effective_value"]))
+        base = next((e for e in env if e.get("role") == "cache_dir"), None)
+        if not base:
+            return None
+        r = self.resolve(key, base)
+        root = Path(self.expand(r["effective_value"]))
+        sub = base.get("subpath", "")
+        return root / sub if sub else root
+
+    def report(self) -> list[dict]:
+        rows: list[dict] = []
+        for key, spec in self.sources.items():
+            for entry in spec.get("env", []):
+                # source_key = which SOURCES entry this belongs to;
+                # resolve()'s "source" = where the value came from (env/rc/tool/default)
+                rows.append({"source_key": key, **self.resolve(key, entry)})
+        return rows
+
+
+def _sync_sources_cache_paths(config: dict, detector: "EnvDetector") -> dict:
+    """Re-derive each source's cache location from live detection into
+    config['sources'][k]['cache_path']. cache_path is ALWAYS recomputed (it mirrors
+    where the tool currently caches); other keys (e.g. managed_env) are preserved."""
+    sources = config.setdefault("sources", {})
+    for key in SOURCES:
+        cd = detector.cache_dir(key)
+        if cd is not None:
+            sources.setdefault(key, {})["cache_path"] = str(cd)
+    return config
+
+
+AIM_ENV_BEGIN = "# >>> aim env >>>"
+AIM_ENV_END = "# <<< aim env <<<"
+AIM_BASH_CHAIN_BEGIN = "# >>> aim bash-chain >>>"
+AIM_BASH_CHAIN_END = "# <<< aim bash-chain <<<"
+
+
+class ShellWriter:
+    """Generate aim-owned env files and wire a single guarded source line into rc files."""
+
+    def __init__(self, home: Optional[Path] = None):
+        self.home = Path(home) if home else Path.home()
+
+    def render_env_file(self, managed: list, fmt: str = "sh") -> str:
+        lines = ["# Generated by aim — do not edit. Run `aim env apply` to regenerate."]
+        cur = None
+        for source, name, value in managed:
+            if source != cur:
+                lines.append(f"# --- {source} ---")
+                cur = source
+            if fmt == "fish":
+                lines.append(f'set -gx {name} "{value}"')
+            else:
+                lines.append(f'export {name}="{value}"')
+        if fmt == "fish":
+            lines.append('test -f "$HOME/.aim/secrets.env"; and source "$HOME/.aim/secrets.env"')
+        else:
+            lines.append('[ -f "$HOME/.aim/secrets.env" ] && . "$HOME/.aim/secrets.env"')
+        return "\n".join(lines) + "\n"
+
+    def source_block(self, fmt: str = "sh") -> str:
+        if fmt == "fish":
+            body = 'test -f "$HOME/.aim/env.fish"; and source "$HOME/.aim/env.fish"'
+        else:
+            body = '[ -f "$HOME/.aim/env.sh" ] && . "$HOME/.aim/env.sh"'
+        return f"{AIM_ENV_BEGIN}\n{body}\n{AIM_ENV_END}\n"
+
+    def wire_rc(self, rc_path: Path, fmt: str = "sh", dry_run: bool = False) -> dict:
+        block = self.source_block(fmt)
+        existing = rc_path.read_text() if rc_path.exists() else ""
+        if AIM_ENV_BEGIN in existing and AIM_ENV_END in existing:
+            pre = existing.split(AIM_ENV_BEGIN)[0]
+            post = existing.split(AIM_ENV_END, 1)[1]
+            new = pre + block.rstrip("\n") + post
+            action = "replace"
+        elif existing == "":
+            new = block
+            action = "append"
+        else:
+            sep = "" if existing.endswith("\n") else "\n"
+            new = existing + sep + "\n" + block
+            action = "append"
+        if dry_run:
+            return {"action": action, "path": str(rc_path), "wrote": False}
+        bak = rc_path.with_suffix(rc_path.suffix + ".aim.bak")
+        if rc_path.exists() and not bak.exists():
+            bak.write_text(existing)
+        rc_path.parent.mkdir(parents=True, exist_ok=True)
+        rc_path.write_text(new)
+        return {"action": action, "path": str(rc_path), "wrote": True}
+
+    def ensure_bash_login_chain(self, dry_run: bool = False) -> Optional[dict]:
+        """Ensure a bash LOGIN shell loads ~/.bashrc (macOS login bash reads ~/.bash_profile).
+        No-op if ~/.bash_profile or ~/.profile already sources ~/.bashrc, or chain already present."""
+        for cand in (self.home / ".bash_profile", self.home / ".profile"):
+            if cand.exists() and ".bashrc" in cand.read_text():
+                return None
+        profile = self.home / ".bash_profile"
+        existing = profile.read_text() if profile.exists() else ""
+        if AIM_BASH_CHAIN_BEGIN in existing:
+            return None
+        block = (f"{AIM_BASH_CHAIN_BEGIN}\n"
+                 '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n'
+                 f"{AIM_BASH_CHAIN_END}\n")
+        if dry_run:
+            return {"action": "chain", "path": str(profile), "wrote": False}
+        bak = profile.with_suffix(profile.suffix + ".aim.bak")
+        if profile.exists() and not bak.exists():
+            bak.write_text(existing)
+        if existing == "":
+            new = block
+        else:
+            sep = "" if existing.endswith("\n") else "\n"
+            new = existing + sep + "\n" + block
+        profile.write_text(new)
+        return {"action": "chain", "path": str(profile), "wrote": True}
+
+    def target_rc(self, shell: str) -> tuple:
+        if shell == "zsh":
+            return self.home / ".zshrc", "sh"
+        if shell == "bash":
+            return self.home / ".bashrc", "sh"
+        if shell == "fish":
+            return self.home / ".config" / "fish" / "config.fish", "fish"
+        return self.home / ".profile", "sh"
+
+    def detect_shell(self) -> str:
+        base = os.path.basename(os.environ.get("SHELL", ""))
+        return base if base in ("zsh", "bash", "fish") else "sh"
+
+
+class SecretStore:
+    """Store secrets (tokens) outside shell rc / env files, in a 0600 file."""
+
+    def __init__(self, home: Optional[Path] = None):
+        self.home = Path(home) if home else Path.home()
+        self.path = self.home / ".aim" / "secrets.env"
+
+    def set_secret(self, name: str, value: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        if self.path.exists():
+            lines = [l for l in self.path.read_text().splitlines()
+                     if not l.strip().startswith(f"export {name}=")]
+        # NOTE: values are assumed free of unescaped " or $ (tokens/paths in practice).
+        lines.append(f'export {name}="{value}"')
+        self.path.write_text("\n".join(lines) + "\n")
+        os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def mask(value: str) -> str:
+        return "set (****)" if value else "unset"
+
+
+class ServiceEnv:
+    """Render commands to set daemon-level env (e.g. ollama server) that ignores shell rc."""
+
+    @staticmethod
+    def ollama_commands(models_path: str, system: str) -> list[str]:
+        if system == "Darwin":
+            return [f'launchctl setenv OLLAMA_MODELS "{models_path}"',
+                    "# restart the Ollama app for the change to take effect"]
+        if system == "Linux":
+            return ["mkdir -p ~/.config/systemd/user/ollama.service.d",
+                    f"printf '[Service]\\nEnvironment=OLLAMA_MODELS={models_path}\\n' "
+                    "> ~/.config/systemd/user/ollama.service.d/aim.conf",
+                    "systemctl --user daemon-reload && systemctl --user restart ollama"]
+        return [f"# set OLLAMA_MODELS={models_path} in your service manager"]
+
+
+def op_env_show(config: dict, detector: Optional["EnvDetector"] = None,
+                json_output: bool = False) -> int:
+    det = detector or EnvDetector()
+    rows = det.report()
+    cache_dirs = {k: str(det.cache_dir(k) or "") for k in SOURCES}
+    if json_output:
+        safe_rows = [
+            ({**r, "effective_value": ("***" if r["effective_value"] else "")}
+             if r.get("secret") else r)
+            for r in rows
+        ]
+        print(json.dumps({"env": safe_rows, "cache_dirs": cache_dirs}, ensure_ascii=False))
+        return 0
+    print(f"{'SOURCE':<13}{'VARIABLE':<28}{'STATUS':<10}VALUE  [ORIGIN]")
+    for r in rows:
+        val = SecretStore.mask(r["effective_value"]) if r["secret"] else r["effective_value"]
+        print(f"{r['source_key']:<13}{r['name']:<28}{r['status']:<10}{val}  [{r['source']}]")
+    print()
+    print("Resolved cache directories:")
+    for k, v in cache_dirs.items():
+        if v:
+            print(f"  {k:<13} {v}")
+    return 0
+
+
+def op_env_path(config: dict, source: str, detector: Optional["EnvDetector"] = None) -> int:
+    det = detector or EnvDetector()
+    if source not in SOURCES:
+        print(f"Unknown source: {source}. Known: {', '.join(SOURCES)}", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    cd = det.cache_dir(source)
+    if cd is None:
+        print(f"Source '{source}' has no cache directory.", file=sys.stderr)
+        return EXIT_FAILED
+    print(str(cd))
+    return 0
+
+
+def _managed_env_pairs(config: dict) -> list:
+    """Collect (source, name, value) for manage:env_file vars from config sources managed_env."""
+    pairs = []
+    for key, spec in SOURCES.items():
+        managed_env = config.get("sources", {}).get(key, {}).get("managed_env", {})
+        env_file_names = [e["name"] for e in spec.get("env", [])
+                          if e.get("manage") == "env_file" and not e.get("secret")]
+        for name in env_file_names:
+            if name in managed_env:
+                pairs.append((key, name, managed_env[name]))
+    return pairs
+
+
+def _source_key_for_var(var: str) -> Optional[str]:
+    for key, spec in SOURCES.items():
+        if any(e["name"] == var for e in spec.get("env", [])):
+            return key
+    return None
+
+
+def _is_secret_var(var: str) -> bool:
+    for spec in SOURCES.values():
+        for e in spec.get("env", []):
+            if e["name"] == var:
+                return bool(e.get("secret"))
+    return False
+
+
+def op_env_apply(config: dict, registry, writer: Optional["ShellWriter"] = None,
+                 home: Optional[Path] = None, shell: str = "", set_vars: Optional[list] = None,
+                 service: bool = False, dry_run: bool = False) -> int:
+    home = Path(home) if home else Path.home()
+    writer = writer or ShellWriter(home=home)
+    for item in (set_vars or []):
+        if "=" not in item:
+            print(f"Invalid --set '{item}', expected VAR=VALUE", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        var, value = item.split("=", 1)
+        key = _source_key_for_var(var)
+        if not key:
+            print(f"Unknown variable: {var}", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        if _is_secret_var(var):
+            # secrets never go to config.json / env.sh / rc; store in the 0600 secrets file
+            SecretStore(home=home).set_secret(var, value)
+        else:
+            config.setdefault("sources", {}).setdefault(key, {}).setdefault("managed_env", {})[var] = value
+    pairs = _managed_env_pairs(config)
+    shells = ["zsh", "bash", "fish"] if shell == "all" else [shell or writer.detect_shell()]
+    if dry_run:
+        print("[dry-run] would write ~/.aim/env.sh, ~/.aim/env.fish and wire:", ", ".join(shells))
+        for s in shells:
+            rc_path, fmt = writer.target_rc(s)
+            r = writer.wire_rc(rc_path, fmt=fmt, dry_run=True)
+            print(f"  {s}: {r['action']} {r['path']}")
+            if s == "bash":
+                ch = writer.ensure_bash_login_chain(dry_run=True)
+                if ch:
+                    print(f"  bash: would chain {ch['path']} -> ~/.bashrc")
+        return 0
+    aim_dir = home / ".aim"
+    aim_dir.mkdir(parents=True, exist_ok=True)
+    (aim_dir / "env.sh").write_text(writer.render_env_file(pairs, fmt="sh"))
+    (aim_dir / "env.fish").write_text(writer.render_env_file(pairs, fmt="fish"))
+    wired = []
+    for s in shells:
+        rc_path, fmt = writer.target_rc(s)
+        r = writer.wire_rc(rc_path, fmt=fmt, dry_run=False)
+        wired.append(r["path"])
+        if s == "bash":
+            writer.ensure_bash_login_chain(dry_run=False)
+    config.setdefault("env", {})
+    config["env"]["managed"] = True
+    config["env"]["shells"] = shells
+    config["env"]["files"] = {"posix": str(aim_dir / "env.sh"), "fish": str(aim_dir / "env.fish")}
+    if registry is not None:
+        save_config(config)
+    if service:
+        models = config.get("sources", {}).get("ollama", {}).get("cache_path") or str(home / ".ollama" / "models")
+        print("Service-level env (run manually):")
+        for c in ServiceEnv.ollama_commands(models, platform.system()):
+            print(f"  {c}")
+    print(f"Wrote {aim_dir/'env.sh'}, {aim_dir/'env.fish'}; wired: {', '.join(wired)}")
+    return 0
+
+
+def op_sources_list(config: dict, detector: Optional["EnvDetector"] = None,
+                    json_output: bool = False) -> int:
+    det = detector or EnvDetector()
+    out = []
+    for key, spec in SOURCES.items():
+        tools = [{"name": t["name"], "installed": _check_backend_available(t, config)}
+                 for t in spec.get("tools", [])]
+        out.append({
+            "key": key,
+            "cache_layout": spec.get("cache_layout"),
+            "cache_dir": str(det.cache_dir(key) or ""),
+            "tools": tools,
+            "env_vars": [e["name"] for e in spec.get("env", [])],
+        })
+    if json_output:
+        print(json.dumps({"sources": out}, ensure_ascii=False))
+        return 0
+    for s in out:
+        tool_str = ", ".join(f"{t['name']}{'✓' if t['installed'] else '✗'}" for t in s["tools"])
+        print(f"{s['key']:<13} layout={s['cache_layout']:<10} tools=[{tool_str}]")
+        if s["cache_dir"]:
+            print(f"              cache: {s['cache_dir']}")
+    return 0
+
+
+def op_sources_install(config: dict, source: str, json_output: bool = False,
+                       auto_confirm: bool = False) -> int:
+    if source not in SOURCES:
+        print(f"Unknown source: {source}. Known: {', '.join(SOURCES)}", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    ok, err = _ensure_backend(source, config, json_output, auto_confirm)
+    if not ok:
+        if err:
+            print(err)
+        return EXIT_BACKEND_MISSING
+    print(f"Source '{source}' has at least one usable tool.")
+    return 0
 
 
 def _build_download_options(config: dict, args: argparse.Namespace) -> DownloadOptions:
@@ -3723,6 +4252,29 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_sub = p_cfg.add_subparsers(dest="config_command")
     cfg_sub.add_parser("show", help="Show current configuration")
 
+    # env
+    p_env = sub.add_parser("env", help="Detect/manage download-source environment variables")
+    env_sub = p_env.add_subparsers(dest="env_command")
+    pe = env_sub.add_parser("show", help="Show detected env vars and cache dirs")
+    pe.add_argument("--json", dest="json_output", action="store_true")
+    pe = env_sub.add_parser("apply", help="Write aim env files and wire shell rc")
+    pe.add_argument("--shell", default="", help="zsh|bash|fish|all (default: detected)")
+    pe.add_argument("--set", dest="set_vars", action="append", default=[], metavar="VAR=VALUE")
+    pe.add_argument("--service", action="store_true", help="Also emit daemon-level env commands")
+    pe.add_argument("--dry-run", dest="dry_run", action="store_true")
+    pe = env_sub.add_parser("path", help="Print resolved cache dir for a source")
+    pe.add_argument("source", help="Source key, e.g. huggingface")
+
+    # sources
+    p_src = sub.add_parser("sources", help="List/manage download sources and their tools")
+    src_sub = p_src.add_subparsers(dest="sources_command")
+    ps = src_sub.add_parser("list", help="List sources, tool install state, env summary")
+    ps.add_argument("--json", dest="json_output", action="store_true")
+    ps = src_sub.add_parser("install", help="Install a download tool for a source")
+    ps.add_argument("source", help="Source key, e.g. huggingface")
+    ps.add_argument("-y", "--yes", dest="auto_confirm", action="store_true")
+    ps.add_argument("--json", dest="json_output", action="store_true")
+
     return parser
 
 
@@ -3947,6 +4499,24 @@ def main() -> int:
         # No args = dry-run preview; --all = execute all
         dry_run = args.dry_run or (not args.organize_all and not args.model_id)
         op_organize(config, registry, model_id=args.model_id, dry_run=dry_run)
+
+    elif cmd == "env":
+        sub_cmd = getattr(args, "env_command", None)
+        if sub_cmd == "path":
+            return op_env_path(config, args.source)
+        elif sub_cmd == "apply":
+            return op_env_apply(config, registry, shell=args.shell, set_vars=args.set_vars,
+                                service=args.service, dry_run=args.dry_run)
+        else:
+            return op_env_show(config, json_output=getattr(args, "json_output", False))
+
+    elif cmd == "sources":
+        sub_cmd = getattr(args, "sources_command", None)
+        if sub_cmd == "install":
+            return op_sources_install(config, args.source,
+                                      json_output=getattr(args, "json_output", False),
+                                      auto_confirm=getattr(args, "auto_confirm", False))
+        return op_sources_list(config, json_output=getattr(args, "json_output", False))
 
     elif cmd == "config":
         if args.config_command == "show":

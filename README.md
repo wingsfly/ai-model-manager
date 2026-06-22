@@ -81,6 +81,17 @@ aim verify --fix
 aim status
 aim status --by category
 
+# Detect / manage download-source env vars (HF, Ollama, ModelScope, PyTorch Hub, Civitai, Git)
+aim env show                          # detected vars + resolved cache dirs (read-only)
+aim env show --json                   # machine-readable; secret values are masked
+aim env path huggingface              # resolved cache dir for a source
+aim env apply --shell zsh             # write ~/.aim/env.{sh,fish} + wire rc (one guarded line)
+aim env apply --set HF_ENDPOINT=https://hf-mirror.com --set HF_HUB_ENABLE_HF_TRANSFER=1
+aim env apply --dry-run               # preview, write nothing
+aim env apply --service               # also print daemon-level (launchctl/systemd) env commands
+aim sources list                      # sources, tool install state, env summary
+aim sources install huggingface -y    # install a source's download tool
+
 # Find duplicates
 aim dedup
 aim dedup --apply
