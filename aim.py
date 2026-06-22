@@ -4060,11 +4060,15 @@ def _ollama_models_root(manifest_path: Path) -> Path:
     p = manifest_path
     while p.parent != p and p.name != "manifests":
         p = p.parent
+    if p.name != "manifests":
+        raise ValueError(f"no 'manifests/' ancestor in {manifest_path}")
     return p.parent
 
 
 def _ollama_read_native(manifest_path: Path, models_root: Path) -> dict:
-    """Parse an ollama manifest into {model, tag, manifest, gguf:{digest,real_path,size}, small_blobs, manifest_rel}."""
+    """Parse an ollama manifest into reconstruct metadata. On-disk blob files use 'sha256-<hex>'
+    (dash); manifests reference 'sha256:<hex>' (colon). We expose dash-form digests + real paths,
+    but keep the raw manifest (colon form) for exact round-trip."""
     manifest = json.loads(manifest_path.read_text())
     blobs_dir = models_root / "blobs"
     layers = list(manifest.get("layers", []))
@@ -4073,15 +4077,21 @@ def _ollama_read_native(manifest_path: Path, models_root: Path) -> dict:
     small = [l for l in layers if l is not gguf_layer]
     if cfg:
         small.append(cfg)
+
+    def disk(d: str) -> str:
+        return d.replace(":", "-")
+
     rel = manifest_path.relative_to(models_root / "manifests")
     parts = rel.parts
     model = parts[-2] if len(parts) >= 2 else manifest_path.parent.name
     tag = parts[-1]
     return {
         "model": model, "tag": tag, "manifest": manifest, "manifest_rel": str(rel),
-        "gguf": {"digest": gguf_layer["digest"], "real_path": str(blobs_dir / gguf_layer["digest"]),
+        "gguf": {"digest": disk(gguf_layer["digest"]),
+                 "real_path": str(blobs_dir / disk(gguf_layer["digest"])),
                  "size": gguf_layer.get("size", 0)} if gguf_layer else None,
-        "small_blobs": [{"digest": b["digest"], "real_path": str(blobs_dir / b["digest"]),
+        "small_blobs": [{"digest": disk(b["digest"]),
+                         "real_path": str(blobs_dir / disk(b["digest"])),
                          "size": b.get("size", 0)} for b in small],
     }
 
@@ -4089,6 +4099,8 @@ def _ollama_read_native(manifest_path: Path, models_root: Path) -> dict:
 def _ollama_build_shim(info: dict, store_dir: Path, models_root: Path) -> None:
     """Rebuild a MISSING ollama cache from store (verify --fix / restore direction):
     hardlink the GGUF blob from store, copy small blobs, write the manifest."""
+    if not info.get("gguf"):
+        raise ValueError("ollama build_shim: manifest info has no GGUF layer")
     blobs_dir = models_root / "blobs"
     blobs_dir.mkdir(parents=True, exist_ok=True)
     store_gguf = store_dir / f"{store_dir.name}.gguf"
@@ -4239,6 +4251,7 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
             store_dir.mkdir(parents=True, exist_ok=True)
             store_gguf = store_dir / f"{target_id}.gguf"
             gguf_blob = Path(info["gguf"]["real_path"])
+            # keep_native is moot for ollama: the cache is never deleted (GGUF shared via inode).
             if LinkManager.same_volume(gguf_blob, store_gguf):
                 os.link(gguf_blob, store_gguf)        # share inode; cache blob untouched
             else:

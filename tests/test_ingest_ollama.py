@@ -17,21 +17,22 @@ def make_ollama_cache(home: Path, model="qwen3", tag="latest"):
     gguf = b"GGUF" + b"W" * 200
     params = b'{"stop":["</s>"]}'
     cfg = b'{"model_format":"gguf"}'
-    def dg(b): return "sha256-" + hashlib.sha256(b).hexdigest()
+    def colon(b): return "sha256:" + hashlib.sha256(b).hexdigest()
+    def dash(b): return "sha256-" + hashlib.sha256(b).hexdigest()
     blobs = home / "blobs"
     for b in (gguf, params, cfg):
-        _write(blobs / dg(b), b)
+        _write(blobs / dash(b), b)                       # on-disk: dash
     manifest = {
         "schemaVersion": 2,
-        "config": {"digest": dg(cfg), "size": len(cfg), "mediaType": "application/vnd.ollama.image.config"},
+        "config": {"digest": colon(cfg), "size": len(cfg), "mediaType": "application/vnd.ollama.image.config"},
         "layers": [
-            {"digest": dg(gguf), "size": len(gguf), "mediaType": "application/vnd.ollama.image.model"},
-            {"digest": dg(params), "size": len(params), "mediaType": "application/vnd.ollama.image.params"},
-        ],
+            {"digest": colon(gguf), "size": len(gguf), "mediaType": "application/vnd.ollama.image.model"},
+            {"digest": colon(params), "size": len(params), "mediaType": "application/vnd.ollama.image.params"},
+        ],                                               # manifest: colon
     }
     man_path = home / "manifests" / "registry.ollama.ai" / "library" / model / tag
     _write(man_path, json.dumps(manifest).encode())
-    return man_path, dg(gguf), gguf
+    return man_path, dash(gguf), gguf                    # return DASH form (matches on-disk + _read_native)
 
 
 class OllamaIngestTests(unittest.TestCase):
