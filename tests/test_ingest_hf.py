@@ -113,6 +113,33 @@ class HFIngestTests(unittest.TestCase):
         self.assertEqual(reg.find("hf-org-model").storage, {})
 
 
+class HFRollbackTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.config = aim.default_config()
+        self.config["roots"] = [{"id": "primary", "path": str(self.home / "AI")}]
+
+    def test_rollback_on_shim_failure(self):
+        repo_dir = make_hf_cache(self.home)
+        reg = aim.Registry()
+        reg.models = [aim.ModelEntry(id="hf-org-model", native_cas=True,
+                      source={"type": "huggingface", "repo_id": "Org/Model"},
+                      category="asr/model", canonical={"root": "primary", "path": str(repo_dir)})]
+        orig = aim._hf_build_shim
+        aim._hf_build_shim = lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))
+        try:
+            ok = aim.op_ingest(self.config, reg, "hf-org-model", registry_save=False)
+        finally:
+            aim._hf_build_shim = orig
+        self.assertFalse(ok)
+        e = reg.find("hf-org-model")
+        self.assertTrue(e.native_cas)
+        self.assertEqual(e.storage, {})
+        store_dir = Path(self.config["roots"][0]["path"]) / "store" / "asr/model" / "hf-org-model"
+        self.assertFalse(store_dir.exists())
+        self.assertTrue((repo_dir / "blobs").exists())
+
+
 class HFBuildShimTests(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
