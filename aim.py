@@ -3963,6 +3963,73 @@ def _hf_build_shim(repo_dir: Path, store_dir: Path, commit: str, files: list) ->
         os.symlink((store_dir / f["name"]).resolve(), target)
 
 
+def _sanitize_ingest_id(entry: "ModelEntry", new_id: str) -> str:
+    return _sanitize_model_id(new_id) if new_id else entry.id
+
+
+def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "",
+              category: str = "", dry_run: bool = False, keep_native: bool = False,
+              registry_save: bool = True, json_output: bool = False) -> bool:
+    """Ingest a native-CAS model into the flat store + rebuild its load shim + annotate."""
+    entry = registry.find(model_id)
+    if not entry:
+        print(f"Error: model '{model_id}' not found.", file=sys.stderr)
+        return False
+    if not entry.native_cas:
+        print(f"Error: '{model_id}' is already managed (native_cas=false).", file=sys.stderr)
+        return False
+    tool = entry.source.get("type", "")
+    root = get_primary_root(config)
+    cache_repo = Path(entry.canonical.get("path", ""))
+    if not cache_repo.is_absolute():
+        cache_repo = Path(root.path) / entry.canonical.get("path", "")
+
+    if tool == "huggingface":
+        info = _hf_read_native(cache_repo)
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "uncategorized"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} ({len(info['files'])} files) -> {store_rel}, "
+                  f"rebuild HF shim at {cache_repo}")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            size = _ingest_to_store(info["files"], store_dir)
+            _hf_build_shim(cache_repo, store_dir, info["commit"], info["files"])
+        except OSError as ex:
+            if store_dir.exists():
+                shutil.rmtree(store_dir, ignore_errors=True)
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": "managed-hf", "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": "huggingface", "kind": "hf-cas",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
+                "cache_root_var": "HF_HOME",
+                "reconstruct": {"repo_id": info["repo_id"], "commit": info["commit"],
+                                "files": [f["name"] for f in info["files"]]},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
+    print(f"Error: ingest not yet implemented for source type '{tool}'.", file=sys.stderr)
+    return False
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}
