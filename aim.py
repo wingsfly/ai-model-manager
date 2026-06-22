@@ -1708,7 +1708,12 @@ def op_env_show(config: dict, detector: Optional["EnvDetector"] = None,
     rows = det.report()
     cache_dirs = {k: str(det.cache_dir(k) or "") for k in SOURCES}
     if json_output:
-        print(json.dumps({"env": rows, "cache_dirs": cache_dirs}, ensure_ascii=False))
+        safe_rows = [
+            ({**r, "effective_value": ("***" if r["effective_value"] else "")}
+             if r.get("secret") else r)
+            for r in rows
+        ]
+        print(json.dumps({"env": safe_rows, "cache_dirs": cache_dirs}, ensure_ascii=False))
         return 0
     print(f"{'SOURCE':<13}{'VARIABLE':<28}{'STATUS':<10}VALUE  [ORIGIN]")
     for r in rows:

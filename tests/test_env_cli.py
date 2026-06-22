@@ -46,6 +46,25 @@ class EnvShowTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn(".cache/huggingface/hub", buf.getvalue())
 
+    def test_env_show_json_masks_secrets(self):
+        cfg = aim.default_config()
+        det = aim.EnvDetector(home=self.home, rc_files=[],
+                              shell_value=lambda v: "supertoken" if v == "HF_TOKEN" else None)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            aim.op_env_show(cfg, detector=det, json_output=True)
+        out = buf.getvalue()
+        self.assertNotIn("supertoken", out)
+        data = json.loads(out)
+        hf_token = next(r for r in data["env"] if r["name"] == "HF_TOKEN")
+        self.assertEqual(hf_token["effective_value"], "***")
+        self.assertTrue(hf_token["secret"])
+
+    def test_env_path_no_cache_dir(self):
+        cfg = aim.default_config()
+        rc = aim.op_env_path(cfg, "url", detector=_detector(self.home))
+        self.assertEqual(rc, aim.EXIT_FAILED)
+
 
 class EnvApplyTests(unittest.TestCase):
     def setUp(self):
