@@ -4290,6 +4290,20 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
     return False
 
 
+def op_ingest_all(config: dict, registry: "Registry", dry_run: bool = False,
+                  keep_native: bool = False, registry_save: bool = True) -> int:
+    native = [m.id for m in list(registry.models) if m.native_cas]
+    done = 0
+    for mid in native:
+        if op_ingest(config, registry, mid, dry_run=dry_run, keep_native=keep_native,
+                     registry_save=False):
+            done += 1
+    if registry_save and not dry_run:
+        registry.save()
+    print(f"Ingested {done}/{len(native)} native model(s).")
+    return done
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}
@@ -4617,6 +4631,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-keep-native", action="store_false", dest="keep_native", help="Remove native source files after convert")
     p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
 
+    # ingest
+    p = sub.add_parser("ingest", help="Ingest a native-CAS model into the store + rebuild its load shim")
+    p.add_argument("model_id", nargs="?", default="", help="Model id (omit with --all-native)")
+    p.add_argument("--all-native", dest="all_native", action="store_true", help="Ingest all native_cas models")
+    p.add_argument("--new-id", dest="new_id", default="", help="Rename on ingest")
+    p.add_argument("--category", default="", help="Override category")
+    p.add_argument("--keep-native", dest="keep_native", action="store_true", help="Keep original native bytes")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true")
+    p.add_argument("--json", dest="json_output", action="store_true")
+
     # dedup
     p = sub.add_parser("dedup", help="Find/fix duplicate files")
     p.add_argument("--scan", action="store_true", dest="dedup_scan", help="Scan only")
@@ -4873,6 +4897,18 @@ def main() -> int:
             keep_native=args.keep_native,
             json_output=args.json_output,
         )
+        return EXIT_OK if ok else EXIT_FAILED
+
+    elif cmd == "ingest":
+        if getattr(args, "all_native", False):
+            op_ingest_all(config, registry, dry_run=args.dry_run, keep_native=args.keep_native)
+            return EXIT_OK
+        if not args.model_id:
+            print("Usage: aim ingest <model_id> | --all-native", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        ok = op_ingest(config, registry, args.model_id, new_id=args.new_id,
+                       category=args.category, dry_run=args.dry_run,
+                       keep_native=args.keep_native, json_output=args.json_output)
         return EXIT_OK if ok else EXIT_FAILED
 
     elif cmd == "dedup":
