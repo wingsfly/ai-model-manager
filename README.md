@@ -75,6 +75,12 @@ aim ingest <model_id> --keep-native   # keep original native bytes (default recl
 aim convert <model_id>                # deprecated alias -> ingest
 aim verify --fix                      # also rebuilds storage shims from the recorded annotation
 
+# Portable backup / restore (store/ + manifest; shims are regenerated on restore)
+aim backup /Volumes/Backup/aim       # mirror store/ + write aim-backup.json (idempotent; re-runnable)
+aim backup /Volumes/Backup/aim --verify
+aim restore /Volumes/Backup/aim      # recreate store, rebuild tool shims for THIS machine, print env to set
+aim restore /Volumes/Backup/aim --apply-env   # also write env to shell config
+
 # Provision a model for an engine
 aim provision <model_id> --engine comfyui
 

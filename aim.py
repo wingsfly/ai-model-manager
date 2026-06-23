@@ -4049,7 +4049,8 @@ def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
     storage = entry.storage or {}
     if not storage.get("shims"):
         return False
-    root = get_primary_root(config)
+    roots = {r.id: r for r in get_roots(config)}
+    root = roots.get(entry.canonical.get("root", "")) or get_primary_root(config)
     store_dir = Path(root.path) / storage.get("store_path", "")
     rebuilt = False
     for shim in storage["shims"]:
@@ -4252,6 +4253,166 @@ def op_ingest_all(config: dict, registry: "Registry", dry_run: bool = False,
         registry.save()
     print(f"Ingested {done}/{len(native)} native model(s).")
     return done
+
+
+# ── Backup / Restore (SP3) ───────────────────────────────────────────────────
+
+
+def _sync_store_dir(src: Path, dst: Path, verify: bool = False) -> tuple[int, int]:
+    """Idempotently copy every real file under src/ into dst/, preserving layout.
+    Skip when dst already has the file at the same size (or same quick_hash when verify).
+    Returns (copied, skipped)."""
+    copied = skipped = 0
+    if not src.exists():
+        return (0, 0)
+    for f in sorted(src.rglob("*")):
+        if not f.is_file() or f.is_symlink():
+            continue
+        target = dst / f.relative_to(src)
+        if target.exists():
+            same = target.stat().st_size == f.stat().st_size
+            if same and verify:
+                same = _quick_hash(target) == _quick_hash(f)
+            if same:
+                skipped += 1
+                continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+        copied += 1
+    return (copied, skipped)
+
+
+def _build_backup_manifest(config: dict, registry: "Registry", store_root: Path) -> dict:
+    """Build the aim-backup.json contents: {aim_backup_version, created_at, source_root,
+    models:[ModelEntry dicts incl. storage annotations], sources, env,
+    store_files:[{path:"store/<rel>", size, quick_hash}]}. This is the restore contract."""
+    store_files = []
+    if store_root.exists():
+        for f in sorted(store_root.rglob("*")):
+            if f.is_file() and not f.is_symlink():
+                store_files.append({"path": str(Path("store") / f.relative_to(store_root)),
+                                    "size": f.stat().st_size, "quick_hash": _quick_hash(f)})
+    return {
+        "aim_backup_version": 1,
+        "created_at": _now_iso(),
+        "source_root": get_primary_root(config).path,
+        "models": [m.to_dict() for m in registry.models],
+        "sources": config.get("sources", {}),
+        "env": config.get("env", {}),
+        "store_files": store_files,
+    }
+
+
+def op_backup(config: dict, registry: "Registry", dest: str, verify: bool = False,
+              json_output: bool = False) -> int:
+    root = get_primary_root(config)
+    store_root = root.store_path
+    dest_dir = Path(dest).expanduser()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    native = [m.id for m in registry.models if m.native_cas]
+    if native and not json_output:
+        shown = ", ".join(native[:5]) + (" ..." if len(native) > 5 else "")
+        print(f"Warning: {len(native)} native model(s) not ingested (not in store, won't be backed up): {shown}")
+        print("  Run 'aim ingest --all-native' first to include them.")
+    copied, skipped = _sync_store_dir(store_root, dest_dir / "store", verify=verify)
+    manifest = _build_backup_manifest(config, registry, store_root)
+    (dest_dir / "aim-backup.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    out = {"status": "backed_up", "dest": str(dest_dir), "copied": copied, "skipped": skipped,
+           "models": len(manifest["models"]), "native_uningested": len(native)}
+    if json_output:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Backed up {len(manifest['models'])} model(s) to {dest_dir} (copied {copied}, skipped {skipped}).")
+    return EXIT_OK
+
+
+def _read_backup_manifest(backup_dir: Path) -> dict:
+    man_path = backup_dir / "aim-backup.json"
+    if not man_path.exists():
+        raise FileNotFoundError(f"no aim-backup.json in {backup_dir}")
+    man = json.loads(man_path.read_text())
+    if man.get("aim_backup_version") != 1:
+        raise ValueError(f"unsupported backup version: {man.get('aim_backup_version')}")
+    return man
+
+
+def _retarget_shim_locations(entry: "ModelEntry", detector: "EnvDetector") -> None:
+    """Recompute each shim's `location` for THIS machine's tool caches (cross-machine restore)."""
+    for shim in entry.storage.get("shims", []):
+        rc = shim.get("reconstruct", {})
+        kind = shim.get("kind")
+        if kind == "hf-cas":
+            hub = detector.cache_dir("huggingface")
+            org, _, repo = rc.get("repo_id", "").partition("/")
+            if hub and org and repo:
+                shim["location"] = str(hub / f"models--{org}--{repo}")
+        elif kind == "ollama-cas":
+            om = detector.cache_dir("ollama")
+            if om and rc.get("manifest_rel"):
+                shim["location"] = str(om / "manifests" / rc["manifest_rel"])
+        elif kind == "ms-dir":
+            ms = detector.cache_dir("modelscope")
+            org, _, _ = rc.get("repo_id", "").partition("/")
+            if ms and org and rc.get("dir_name"):
+                shim["location"] = str(ms / "models" / org / rc["dir_name"])
+
+
+def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",
+               apply_env: bool = False, verify: bool = False, registry_save: bool = True,
+               detector: Optional["EnvDetector"] = None, json_output: bool = False) -> int:
+    backup_dir = Path(src).expanduser()
+    try:
+        man = _read_backup_manifest(backup_dir)
+    except (FileNotFoundError, ValueError) as ex:
+        print(f"Error: {ex}", file=sys.stderr)
+        return EXIT_FAILED
+    roots = {r.id: r for r in get_roots(config)}
+    root = roots.get(root_id) if root_id else get_primary_root(config)
+    if not root:
+        print(f"Error: unknown root '{root_id}'", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    if man.get("store_files") and not (backup_dir / "store").exists():
+        print(f"Warning: backup at {backup_dir} lists {len(man['store_files'])} store file(s) "
+              f"but has no store/ directory — restore may be incomplete.", file=sys.stderr)
+    copied, skipped = _sync_store_dir(backup_dir / "store", root.store_path, verify=verify)
+    det = detector or EnvDetector()
+    rebuilt = 0
+    errors: list = []
+    for md in man.get("models", []):
+        entry = ModelEntry.from_dict(md)
+        entry.canonical = dict(entry.canonical or {})
+        entry.canonical["root"] = root.id
+        if entry.storage.get("shims"):
+            _retarget_shim_locations(entry, det)
+            try:
+                if _rebuild_shim_from_storage(config, entry):
+                    rebuilt += 1
+            except Exception as ex:
+                errors.append((entry.id, str(ex)))
+        registry.add(entry)
+    csources = config.setdefault("sources", {})
+    for k, v in man.get("sources", {}).items():
+        if isinstance(v, dict) and v.get("managed_env"):
+            csources.setdefault(k, {}).setdefault("managed_env", {}).update(v["managed_env"])
+    if registry_save:
+        registry.save()
+        save_config(config)
+    if apply_env:
+        op_env_apply(config, registry)
+        if not json_output:
+            print("Applied env to shell config.")
+    elif not json_output:
+        print("Recommended: run 'aim env apply' to set tool env vars on this machine.")
+    for mid, err in errors:
+        print(f"  shim rebuild failed for {mid}: {err}", file=sys.stderr)
+    out = {"status": "restored", "root": root.id, "models": len(man.get("models", [])),
+           "store_copied": copied, "store_skipped": skipped, "shims_rebuilt": rebuilt, "errors": len(errors)}
+    if json_output:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Restored {out['models']} model(s) to root '{root.id}' "
+              f"(store copied {copied}, skipped {skipped}; shims rebuilt {rebuilt}, errors {len(errors)}).")
+    return EXIT_OK if not errors else EXIT_FAILED
 
 
 # ── Path Resolution ────────────────────────────────────────────────────────
@@ -4591,6 +4752,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", dest="dry_run", action="store_true")
     p.add_argument("--json", dest="json_output", action="store_true")
 
+    p = sub.add_parser("backup", help="Back up store/ + a portable manifest to a directory")
+    p.add_argument("dest", help="Destination directory (external drive / another path)")
+    p.add_argument("--verify", action="store_true", help="Compare by quick-hash, not just size")
+    p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
+
+    p = sub.add_parser("restore", help="Restore store/ + rebuild tool shims from a backup directory")
+    p.add_argument("src", help="Backup directory (containing aim-backup.json)")
+    p.add_argument("--root", dest="root_id", default="", help="Target storage root id (default: primary)")
+    p.add_argument("--apply-env", dest="apply_env", action="store_true", help="Also write env to shell config")
+    p.add_argument("--verify", action="store_true", help="Compare by quick-hash, not just size")
+    p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
+
     # dedup
     p = sub.add_parser("dedup", help="Find/fix duplicate files")
     p.add_argument("--scan", action="store_true", dest="dedup_scan", help="Scan only")
@@ -4892,6 +5065,15 @@ def main() -> int:
                                       json_output=getattr(args, "json_output", False),
                                       auto_confirm=getattr(args, "auto_confirm", False))
         return op_sources_list(config, json_output=getattr(args, "json_output", False))
+
+    elif cmd == "backup":
+        return op_backup(config, registry, args.dest, verify=args.verify,
+                         json_output=args.json_output)
+
+    elif cmd == "restore":
+        return op_restore(config, registry, args.src, root_id=args.root_id,
+                          apply_env=args.apply_env, verify=args.verify,
+                          json_output=args.json_output)
 
     elif cmd == "config":
         if args.config_command == "show":
