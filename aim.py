@@ -4282,6 +4282,9 @@ def _sync_store_dir(src: Path, dst: Path, verify: bool = False) -> tuple[int, in
 
 
 def _build_backup_manifest(config: dict, registry: "Registry", store_root: Path) -> dict:
+    """Build the aim-backup.json contents: {aim_backup_version, created_at, source_root,
+    models:[ModelEntry dicts incl. storage annotations], sources, env,
+    store_files:[{path:"store/<rel>", size, quick_hash}]}. This is the restore contract."""
     store_files = []
     if store_root.exists():
         for f in sorted(store_root.rglob("*")):
@@ -4291,7 +4294,7 @@ def _build_backup_manifest(config: dict, registry: "Registry", store_root: Path)
     return {
         "aim_backup_version": 1,
         "created_at": _now_iso(),
-        "source_root": str(Path(get_primary_root(config).path)),
+        "source_root": get_primary_root(config).path,
         "models": [m.to_dict() for m in registry.models],
         "sources": config.get("sources", {}),
         "env": config.get("env", {}),

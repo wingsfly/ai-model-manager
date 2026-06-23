@@ -1,5 +1,8 @@
 import unittest
 import tempfile
+import io
+import json
+from contextlib import redirect_stdout
 from pathlib import Path
 import aim
 
@@ -36,11 +39,6 @@ class SyncStoreDirTests(unittest.TestCase):
 
     def test_missing_src_is_noop(self):
         self.assertEqual(aim._sync_store_dir(self.tmp / "nope", self.tmp / "d"), (0, 0))
-
-
-import io
-import json
-from contextlib import redirect_stdout
 
 
 class BackupTests(unittest.TestCase):
