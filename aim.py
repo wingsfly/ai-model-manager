@@ -4044,6 +4044,40 @@ def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
             backup.unlink()
 
 
+def _flatfile_read_native(file_path) -> dict:
+    """A single weight file IS the model. Returns {files:[{name, real_path, size}]}."""
+    f = Path(file_path)
+    size = f.stat().st_size if f.exists() else 0
+    return {"files": [{"name": f.name, "real_path": str(f), "size": size}]}
+
+
+def _flatfile_build_shim(orig_file: Path, store_file: Path) -> None:
+    """Replace a single cache file with a symlink -> store_file, safely (rename-aside + restore).
+    The original is renamed aside first; if creating the symlink fails it is restored."""
+    orig_file = Path(orig_file)
+    orig_file.parent.mkdir(parents=True, exist_ok=True)
+    link = store_file.resolve()
+    backup = orig_file.parent / (orig_file.name + ".aim-old")
+    if backup.is_symlink() or backup.is_file():
+        backup.unlink()
+    elif backup.is_dir():
+        shutil.rmtree(backup)
+    had_original = orig_file.exists() or orig_file.is_symlink()
+    if had_original:
+        os.rename(orig_file, backup)
+    try:
+        os.symlink(link, orig_file)
+    except OSError:
+        if had_original and not (orig_file.exists() or orig_file.is_symlink()):
+            os.rename(backup, orig_file)
+        raise
+    if had_original and (backup.exists() or backup.is_symlink()):
+        if backup.is_dir() and not backup.is_symlink():
+            shutil.rmtree(backup)
+        else:
+            backup.unlink()
+
+
 def _ollama_models_root(manifest_path: Path) -> Path:
     """Given .../manifests/<reg>/<ns>/<model>/<tag>, return the dir containing manifests/ and blobs/."""
     p = manifest_path
