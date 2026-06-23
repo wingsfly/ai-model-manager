@@ -75,6 +75,11 @@ aim ingest <model_id> --keep-native   # keep original native bytes (default recl
 aim convert <model_id>                # deprecated alias -> ingest
 aim verify --fix                      # also rebuilds storage shims from the recorded annotation
 
+# Ingestable sources now include single-file weights:
+#   PyTorch Hub    ($TORCH_HOME/hub/checkpoints/*.pth)              -> aim ingest <torch-id>
+#   openai-whisper (${XDG_CACHE_HOME:-~/.cache}/whisper/*.pt)       -> aim ingest <whisper-id>
+# aim scan discovers them; ingest copies into store and leaves a file symlink so the tool still loads.
+
 # Portable backup / restore (store/ + manifest; shims are regenerated on restore)
 aim backup /Volumes/Backup/aim       # mirror store/ + write aim-backup.json (idempotent; re-runnable)
 aim backup /Volumes/Backup/aim --verify

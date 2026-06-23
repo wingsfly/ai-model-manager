@@ -51,6 +51,7 @@ CATEGORIES = [
 ENGINE_NAMES = [
     "ollama", "huggingface", "omlx", "comfyui", "whisper",
     "coqui", "sparktts", "piper", "fish-speech", "modelscope",
+    "pytorch-hub", "whisper-cache",
 ]
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
@@ -212,6 +213,8 @@ def default_config() -> dict:
             "piper":       {"enabled": True, "model_dir": "piper"},
             "fish-speech": {"enabled": True, "model_dir": "services/fish-speech"},
             "modelscope":  {"enabled": True, "model_dir": "modelscope", "native_cas": True},
+            "pytorch-hub": {"enabled": True, "model_dir": "torch/hub", "native_cas": True},
+            "whisper-cache": {"enabled": True, "model_dir": ".cache/whisper", "native_cas": True},
         },
         "sources": {},
         "env": {"managed": False, "shells": [], "files": {}},
@@ -1095,6 +1098,73 @@ class ModelScopeAdapter(EngineAdapter):
         return False
 
 
+class PyTorchHubAdapter(EngineAdapter):
+    name = "pytorch-hub"
+
+    def supported_formats(self) -> list[str]:
+        return ["pt", "pth"]
+
+    def scan(self) -> list[ScannedModel]:
+        results: list[ScannedModel] = []
+        ckpt = self.base_path / "checkpoints"
+        if not ckpt.is_dir():
+            return results
+        for f in sorted(ckpt.iterdir()):
+            if not f.is_file() or f.is_symlink() or f.suffix not in (".pt", ".pth"):
+                continue
+            stem = f.stem
+            results.append(ScannedModel(
+                id=self._make_id(f"torch-{stem}"), name=stem, path=str(f), engine=self.name,
+                format=f.suffix[1:], size_bytes=f.stat().st_size,
+                category=self._infer_cat(stem), tags=["pytorch-hub"],
+                source={"type": "pytorch-hub", "repo_id": stem},
+                native_cas=True, is_directory=False))
+        return results
+
+    def _infer_cat(self, name: str) -> str:
+        n = name.lower()
+        if any(k in n for k in ["wav2vec", "w2v", "whisper", "asr", "hubert", "wavlm", "conformer"]):
+            return "asr/model"
+        if "vad" in n:
+            return "audio/vad"
+        return "uncategorized"
+
+    def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
+        return []
+
+    def unprovision(self, model: ModelEntry) -> bool:
+        return False
+
+
+class WhisperCacheAdapter(EngineAdapter):
+    name = "whisper-cache"
+
+    def supported_formats(self) -> list[str]:
+        return ["pt"]
+
+    def scan(self) -> list[ScannedModel]:
+        results: list[ScannedModel] = []
+        base = self.base_path
+        if not base.is_dir():
+            return results
+        for f in sorted(base.iterdir()):
+            if not f.is_file() or f.is_symlink() or f.suffix != ".pt":
+                continue
+            results.append(ScannedModel(
+                id=self._make_id(f"whisper-{f.stem}"), name=f"whisper-{f.stem}", path=str(f),
+                engine=self.name, format="pt", size_bytes=f.stat().st_size,
+                category="asr/model", tags=["whisper", "openai-whisper"],
+                source={"type": "whisper-cache", "repo_id": f.stem},
+                native_cas=True, is_directory=False))
+        return results
+
+    def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
+        return []
+
+    def unprovision(self, model: ModelEntry) -> bool:
+        return False
+
+
 # Adapter registry
 ADAPTERS: dict[str, type[EngineAdapter]] = {
     "ollama": OllamaAdapter,
@@ -1107,6 +1177,8 @@ ADAPTERS: dict[str, type[EngineAdapter]] = {
     "piper": PiperAdapter,
     "fish-speech": FishSpeechAdapter,
     "modelscope": ModelScopeAdapter,
+    "pytorch-hub": PyTorchHubAdapter,
+    "whisper-cache": WhisperCacheAdapter,
 }
 
 
@@ -1371,7 +1443,7 @@ SOURCES: dict[str, dict] = {
     },
     "pytorch-hub": {
         "aliases": ["torch", "pytorch"],
-        "cache_layout": "torch-hub",
+        "cache_layout": "flat-file",
         "tools": [
             {"name": "python3", "check": "which", "install_cmd": "brew install python",
              "description": "Python (torch.hub)"},
@@ -1380,6 +1452,15 @@ SOURCES: dict[str, dict] = {
             {"name": "TORCH_HOME", "role": "cache_dir", "default": "~/.cache/torch",
              "subpath": "hub", "detect": ["env", "rc", "tool"], "manage": "env_file", "secret": False},
         ],
+    },
+    "whisper-cache": {
+        "aliases": ["whisper-dl"],
+        "cache_layout": "flat-file",
+        "tools": [{"name": "whisper", "check": "which",
+                   "install_cmd": "pip3 install --break-system-packages -U openai-whisper",
+                   "description": "openai-whisper"}],
+        "env": [{"name": "XDG_CACHE_HOME", "role": "cache_dir", "default": "~/.cache",
+                 "subpath": "whisper", "detect": ["env", "rc"], "manage": "none", "secret": False}],
     },
     "civitai": {
         "aliases": [],
@@ -4017,31 +4098,49 @@ def _ms_read_native(repo_dir: Path) -> dict:
     return {"files": files, "dir_name": repo_dir.name}
 
 
-def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
-    """Replace the MS cache model dir with a directory symlink -> store, safely.
-    The original is renamed aside first; if creating the symlink fails it is restored,
-    so there is never a moment where both the original and the store copy could be lost."""
-    repo_dir.parent.mkdir(parents=True, exist_ok=True)
-    link = store_dir.resolve()
-    backup = repo_dir.parent / (repo_dir.name + ".aim-old")
+def _replace_with_symlink(orig: Path, target: Path) -> None:
+    """Replace `orig` (a file or dir) with a symlink -> target, safely: rename the original aside
+    (.aim-old) first; if creating the symlink fails, restore it; remove the backup on success.
+    There is never a moment where both the original and the store copy could be lost."""
+    orig = Path(orig)
+    orig.parent.mkdir(parents=True, exist_ok=True)
+    link = Path(target).resolve()
+    backup = orig.parent / (orig.name + ".aim-old")
     if backup.is_symlink() or backup.is_file():
         backup.unlink()
     elif backup.is_dir():
         shutil.rmtree(backup)
-    had_original = repo_dir.exists() or repo_dir.is_symlink()
+    had_original = orig.exists() or orig.is_symlink()
     if had_original:
-        os.rename(repo_dir, backup)            # original -> backup (atomic; original intact if this throws)
+        os.rename(orig, backup)
     try:
-        os.symlink(link, repo_dir)             # create the shim
+        os.symlink(link, orig)
     except OSError:
-        if had_original and not (repo_dir.exists() or repo_dir.is_symlink()):
-            os.rename(backup, repo_dir)        # restore original on failure
+        if had_original and not (orig.exists() or orig.is_symlink()):
+            os.rename(backup, orig)
         raise
     if had_original and (backup.exists() or backup.is_symlink()):
         if backup.is_dir() and not backup.is_symlink():
             shutil.rmtree(backup)
         else:
             backup.unlink()
+
+
+def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
+    """Replace the MS cache model dir with a directory symlink -> store (safe rename-aside)."""
+    _replace_with_symlink(repo_dir, store_dir)
+
+
+def _flatfile_read_native(file_path) -> dict:
+    """A single weight file IS the model. Returns {files:[{name, real_path, size}]}."""
+    f = Path(file_path)
+    size = f.stat().st_size if f.exists() else 0
+    return {"files": [{"name": f.name, "real_path": str(f), "size": size}]}
+
+
+def _flatfile_build_shim(orig_file: Path, store_file: Path) -> None:
+    """Replace a single cache file with a symlink -> store_file (safe rename-aside)."""
+    _replace_with_symlink(orig_file, store_file)
 
 
 def _ollama_models_root(manifest_path: Path) -> Path:
@@ -4142,6 +4241,10 @@ def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
                     "manifest": rc.get("manifest", {}),
                     "manifest_rel": rc.get("manifest_rel", "")}
             _ollama_build_shim(info, store_dir, models_root)
+            rebuilt = True
+        elif shim["kind"] == "flat-file":
+            store_file = store_dir / rc.get("filename", "")
+            _flatfile_build_shim(cache_path, store_file)
             rebuilt = True
     return rebuilt
 
@@ -4308,6 +4411,53 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
         print(f"Ingested {model_id} -> {store_rel}")
         return True
 
+    if tool in ("pytorch-hub", "whisper-cache"):
+        info = _flatfile_read_native(cache_repo)
+        fname = info["files"][0]["name"]
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "uncategorized"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} -> {store_rel}/{fname}, symlink original back")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            size = _ingest_to_store(info["files"], store_dir)
+            _flatfile_build_shim(cache_repo, store_dir / fname)
+        except OSError as ex:
+            if store_dir.exists():
+                shutil.rmtree(store_dir, ignore_errors=True)
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        # rel = path of the cache file relative to the source's cache_dir, derived structurally:
+        # torch checkpoints live under hub/checkpoints/; whisper .pt sits directly in the cache dir.
+        rel = f"checkpoints/{fname}" if tool == "pytorch-hub" else fname
+        cls = "managed-torch" if tool == "pytorch-hub" else "managed-whisper"
+        cache_root_var = "TORCH_HOME" if tool == "pytorch-hub" else "XDG_CACHE_HOME"
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.format = fname.rsplit(".", 1)[-1] if "." in fname else entry.format
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": cls, "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": tool, "kind": "flat-file",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
+                "cache_root_var": cache_root_var,
+                "reconstruct": {"filename": fname, "rel": rel},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
     print(f"Error: ingest not yet implemented for source type '{tool}'.", file=sys.stderr)
     return False
 
@@ -4426,6 +4576,11 @@ def _retarget_shim_locations(entry: "ModelEntry", detector: "EnvDetector") -> No
             org, _, _ = rc.get("repo_id", "").partition("/")
             if ms and org and rc.get("dir_name"):
                 shim["location"] = str(ms / "models" / org / rc["dir_name"])
+        elif kind == "flat-file":
+            base = detector.cache_dir(shim.get("tool", ""))
+            rel = rc.get("rel", "")
+            if base and rel:
+                shim["location"] = str(base / rel)
 
 
 def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",

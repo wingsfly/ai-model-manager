@@ -180,6 +180,8 @@ aim ingest <model_id> --new-id NEW --category CAT
 
 **安全：** copy 优先，壳建好前原生字节始终完好；失败自动回滚，绝不丢数据；`--dry-run` 不落盘。
 
+aim 现在还能摄取**单文件权重**模型——PyTorch Hub 的 `checkpoints/*.pth`（源 `pytorch-hub`，`TORCH_HOME`）和 openai-whisper 的 `*.pt`（源 `whisper-cache`，`${XDG_CACHE_HOME:-~/.cache}/whisper`）。`aim scan` 发现它们，`aim ingest` 复制进 store 并在原处留**文件软链**（工具照常按原路径加载）；PyTorch Hub 仅摄取 checkpoints，代码仓不纳管。
+
 ### aim convert（已弃用）
 
 `aim convert` 现在是 `aim ingest` 的弃用别名，会打印提示并委托给 ingest。请改用 `aim ingest`。
