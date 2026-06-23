@@ -1342,7 +1342,7 @@ SOURCES: dict[str, dict] = {
         ],
         "env": [
             {"name": "OLLAMA_MODELS", "role": "cache_dir", "default": "~/.ollama/models",
-             "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
+             "subpath": "", "detect": ["env", "rc", "tool"], "manage": "service", "secret": False},
             {"name": "OLLAMA_HOST", "role": "endpoint", "default": "127.0.0.1:11434",
              "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
         ],
@@ -1495,6 +1495,76 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
 # ── Sources & Env (SP1) ──────────────────────────────────────────────────────
 
 
+def _parse_env_token_line(text: str, var: str) -> Optional[str]:
+    """Find VAR=value in a whitespace-separated env dump (e.g. `ps eww` output).
+    Whitespace-split, so a value containing spaces may be missed (acceptable for `ps`)."""
+    prefix = var + "="
+    for tok in text.split():
+        if tok.startswith(prefix):
+            return tok[len(prefix):] or None
+    return None
+
+
+def _parse_environ_bytes(data: bytes, var: str) -> Optional[str]:
+    """Find VAR=value in NUL-delimited /proc/<pid>/environ bytes (space-safe)."""
+    prefix = (var + "=").encode()
+    for entry in data.split(b"\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix):].decode("utf-8", "replace") or None
+    return None
+
+
+def _pid_env_value(pid: str, var: str) -> Optional[str]:
+    """Read one env var from a single process's environment. Linux: /proc/<pid>/environ
+    (NUL-delimited, space-safe); else `ps eww <pid>`. Returns None (never raises) on any failure."""
+    environ = Path("/proc") / pid / "environ"
+    try:
+        if environ.exists():
+            return _parse_environ_bytes(environ.read_bytes(), var)
+    except OSError:
+        return None
+    try:
+        ps = subprocess.run(["ps", "eww", pid], capture_output=True, text=True,
+                            timeout=5, errors="replace")
+        return _parse_env_token_line(ps.stdout, var)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _detect_ollama_models() -> Optional[str]:
+    """Find OLLAMA_MODELS set OUTSIDE the shell (macOS Ollama.app / a service manager).
+    On macOS tries `launchctl getenv` first; on any platform falls back to reading the running
+    ollama server process environment (Linux: /proc/<pid>/environ; macOS/BSD: `ps eww`).
+    Returns the path or None; never raises (best-effort)."""
+    try:
+        r = subprocess.run(["launchctl", "getenv", "OLLAMA_MODELS"],
+                           capture_output=True, text=True, timeout=5, errors="replace")
+        if r.stdout.strip():
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    try:
+        pg = subprocess.run(["pgrep", "-f", "ollama"], capture_output=True, text=True,
+                            timeout=5, errors="replace")
+        pids = pg.stdout.split()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pids = []
+    for pid in pids:
+        val = _pid_env_value(pid, "OLLAMA_MODELS")  # per-PID isolated; a bad PID is skipped
+        if val:
+            return val
+    return None
+
+
+def _builtin_tool_probe(var: str, entry: dict) -> Optional[str]:
+    """Default `tool` detector used by EnvDetector when no custom probe is injected. Called for
+    every var whose detect list includes 'tool' (currently HF_HOME/HF_TOKEN/TORCH_HOME/OLLAMA_MODELS);
+    only OLLAMA_MODELS is handled — returns None for the rest, so their behavior is unchanged."""
+    if var == "OLLAMA_MODELS":
+        return _detect_ollama_models()
+    return None
+
+
 class EnvDetector:
     """Read-only resolver for source env vars across shells/tools."""
 
@@ -1593,8 +1663,9 @@ class EnvDetector:
                 effective, source = live, "env"
         if effective is None and rc_hits:
             effective, source = rc_hits[0][1], f"rc:{rc_hits[0][0]}"
-        if effective is None and "tool" in detect and self._tool_probe:
-            tv = self._tool_probe(var, entry)
+        if effective is None and "tool" in detect:
+            probe = self._tool_probe or _builtin_tool_probe
+            tv = probe(var, entry)
             if tv:
                 effective, source = tv, "tool"
         recommended = self._recommended.get(var, "")
