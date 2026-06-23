@@ -4172,7 +4172,7 @@ def _ollama_read_native(manifest_path: Path, models_root: Path) -> dict:
     but keep the raw manifest (colon form) for exact round-trip."""
     manifest = json.loads(manifest_path.read_text())
     blobs_dir = models_root / "blobs"
-    layers = list(manifest.get("layers", []))
+    layers = list(manifest.get("layers") or [])  # cloud stubs have "layers": null
     cfg = manifest.get("config")
     gguf_layer = max(layers, key=lambda l: l.get("size", 0)) if layers else None
     small = [l for l in layers if l is not gguf_layer]
@@ -4480,9 +4480,12 @@ def op_ingest_all(config: dict, registry: "Registry", dry_run: bool = False,
     native = [m.id for m in list(registry.models) if m.native_cas]
     done = 0
     for mid in native:
-        if op_ingest(config, registry, mid, dry_run=dry_run, keep_native=keep_native,
-                     registry_save=False):
-            done += 1
+        try:
+            if op_ingest(config, registry, mid, dry_run=dry_run, keep_native=keep_native,
+                         registry_save=False):
+                done += 1
+        except Exception as ex:  # one bad model must never abort the whole batch
+            print(f"Error: ingest of {mid} failed: {ex}", file=sys.stderr)
     if registry_save and not dry_run:
         registry.save()
     print(f"Ingested {done}/{len(native)} native model(s).")
