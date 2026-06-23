@@ -221,11 +221,24 @@ def default_config() -> dict:
     }
 
 
+def _merge_config_defaults(loaded: dict) -> dict:
+    """Forward-compat: backfill top-level keys + engine entries added to default_config since
+    this config file was written (e.g. modelscope/pytorch-hub/whisper-cache). User values win
+    for keys that already exist; defaults only fill gaps."""
+    d = default_config()
+    for k, v in d.items():
+        if k == "engines":
+            loaded["engines"] = {**v, **loaded.get("engines", {})}
+        elif k not in loaded:
+            loaded[k] = v
+    return loaded
+
+
 def load_config() -> dict:
     config_path = AIM_HOME / CONFIG_FILE
     if config_path.exists():
         with open(config_path) as f:
-            return json.load(f)
+            return _merge_config_defaults(json.load(f))
     return default_config()
 
 
