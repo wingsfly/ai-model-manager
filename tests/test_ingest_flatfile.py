@@ -120,5 +120,73 @@ class WhisperIngestTests(unittest.TestCase):
         self.assertEqual(e.storage["shims"][0]["reconstruct"], {"filename": "base.pt", "rel": "base.pt"})
 
 
+import io
+from contextlib import redirect_stdout
+
+
+class FlatFileRetargetVerifyTests(unittest.TestCase):
+    def test_retarget_torch_and_whisper(self):
+        det = aim.EnvDetector(home=Path("/h"), rc_files=[],
+                              shell_value=lambda v: {"TORCH_HOME": "/tgt/torch"}.get(v))
+        e = aim.ModelEntry(id="t", storage={"store_path": "store/x", "shims": [
+            {"tool": "pytorch-hub", "kind": "flat-file", "location": "/OLD/x.pth",
+             "reconstruct": {"filename": "x.pth", "rel": "checkpoints/x.pth"}}]})
+        aim._retarget_shim_locations(e, det)
+        self.assertEqual(e.storage["shims"][0]["location"], "/tgt/torch/hub/checkpoints/x.pth")
+
+        det2 = aim.EnvDetector(home=Path("/h"), rc_files=[], shell_value=lambda v: None)
+        e2 = aim.ModelEntry(id="w", storage={"store_path": "store/x", "shims": [
+            {"tool": "whisper-cache", "kind": "flat-file", "location": "/OLD/base.pt",
+             "reconstruct": {"filename": "base.pt", "rel": "base.pt"}}]})
+        aim._retarget_shim_locations(e2, det2)
+        self.assertEqual(e2.storage["shims"][0]["location"], "/h/.cache/whisper/base.pt")
+
+    def test_verify_fix_rebuilds_flatfile_shim(self):
+        home = Path(tempfile.mkdtemp())
+        cfg = aim.default_config(); cfg["roots"] = [{"id": "primary", "path": str(home / "AI")}]
+        hub = Path(cfg["roots"][0]["path"]) / "torch" / "hub"
+        cfg["sources"]["pytorch-hub"] = {"cache_path": str(hub)}
+        ckpt = _write(hub / "checkpoints" / "wav2vec2.pth", b"W" * 32)
+        reg = aim.Registry()
+        reg.models = [aim.ModelEntry(id="torch-wav2vec2", native_cas=True,
+                      source={"type": "pytorch-hub", "repo_id": "wav2vec2"}, category="asr/model",
+                      canonical={"root": "primary", "path": str(ckpt)})]
+        aim.op_ingest(cfg, reg, "torch-wav2vec2", registry_save=False)
+        ckpt.unlink()  # destroy the shim symlink
+        with redirect_stdout(io.StringIO()):
+            aim.op_verify(cfg, reg, fix=True)
+        self.assertTrue(ckpt.is_symlink())
+        store = Path(cfg["roots"][0]["path"]) / reg.find("torch-wav2vec2").storage["store_path"]
+        self.assertEqual(ckpt.resolve(), (store / "wav2vec2.pth").resolve())
+
+    def test_restore_roundtrip_crossmachine_flatfile(self):
+        src = Path(tempfile.mkdtemp())
+        scfg = aim.default_config(); scfg["roots"] = [{"id": "primary", "path": str(src / "AI")}]
+        shub = Path(scfg["roots"][0]["path"]) / "torch" / "hub"
+        scfg["sources"]["pytorch-hub"] = {"cache_path": str(shub)}
+        ckpt = _write(shub / "checkpoints" / "wav2vec2.pth", b"W" * 48)
+        sreg = aim.Registry()
+        sreg.models = [aim.ModelEntry(id="torch-wav2vec2", native_cas=True,
+                       source={"type": "pytorch-hub", "repo_id": "wav2vec2"}, category="asr/model",
+                       canonical={"root": "primary", "path": str(ckpt)})]
+        aim.op_ingest(scfg, sreg, "torch-wav2vec2", registry_save=False)
+        backup = src / "bk"
+        with redirect_stdout(io.StringIO()):
+            aim.op_backup(scfg, sreg, str(backup))
+        tgt = Path(tempfile.mkdtemp())
+        tgt_torch = tgt / "torchcache"
+        tcfg = aim.default_config(); tcfg["roots"] = [{"id": "primary", "path": str(tgt / "AI")}]
+        det = aim.EnvDetector(home=tgt, rc_files=[],
+                              shell_value=lambda v: str(tgt_torch) if v == "TORCH_HOME" else None)
+        with redirect_stdout(io.StringIO()):
+            rc = aim.op_restore(tcfg, aim.Registry(), str(backup), detector=det, registry_save=False)
+        self.assertEqual(rc, aim.EXIT_OK)
+        link = tgt_torch / "hub" / "checkpoints" / "wav2vec2.pth"
+        self.assertTrue(link.is_symlink())
+        tgt_store = Path(tcfg["roots"][0]["path"]) / "store" / "asr" / "model" / "torch-wav2vec2"
+        self.assertEqual(link.resolve(), (tgt_store / "wav2vec2.pth").resolve())
+        self.assertEqual(link.resolve().read_bytes(), b"W" * 48)
+
+
 if __name__ == "__main__":
     unittest.main()

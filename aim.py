@@ -4243,6 +4243,10 @@ def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
                     "manifest_rel": rc.get("manifest_rel", "")}
             _ollama_build_shim(info, store_dir, models_root)
             rebuilt = True
+        elif shim["kind"] == "flat-file":
+            store_file = store_dir / rc.get("filename", "")
+            _flatfile_build_shim(cache_path, store_file)
+            rebuilt = True
     return rebuilt
 
 
@@ -4576,6 +4580,11 @@ def _retarget_shim_locations(entry: "ModelEntry", detector: "EnvDetector") -> No
             org, _, _ = rc.get("repo_id", "").partition("/")
             if ms and org and rc.get("dir_name"):
                 shim["location"] = str(ms / "models" / org / rc["dir_name"])
+        elif kind == "flat-file":
+            base = detector.cache_dir(shim.get("tool", ""))
+            rel = rc.get("rel", "")
+            if base and rel:
+                shim["location"] = str(base / rel)
 
 
 def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",
