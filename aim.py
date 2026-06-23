@@ -4325,6 +4325,37 @@ def op_backup(config: dict, registry: "Registry", dest: str, verify: bool = Fals
     return EXIT_OK
 
 
+def _read_backup_manifest(backup_dir: Path) -> dict:
+    man_path = backup_dir / "aim-backup.json"
+    if not man_path.exists():
+        raise FileNotFoundError(f"no aim-backup.json in {backup_dir}")
+    man = json.loads(man_path.read_text())
+    if man.get("aim_backup_version") != 1:
+        raise ValueError(f"unsupported backup version: {man.get('aim_backup_version')}")
+    return man
+
+
+def _retarget_shim_locations(entry: "ModelEntry", detector: "EnvDetector") -> None:
+    """Recompute each shim's `location` for THIS machine's tool caches (cross-machine restore)."""
+    for shim in entry.storage.get("shims", []):
+        rc = shim.get("reconstruct", {})
+        kind = shim.get("kind")
+        if kind == "hf-cas":
+            hub = detector.cache_dir("huggingface")
+            org, _, repo = rc.get("repo_id", "").partition("/")
+            if hub and org and repo:
+                shim["location"] = str(hub / f"models--{org}--{repo}")
+        elif kind == "ollama-cas":
+            om = detector.cache_dir("ollama")
+            if om and rc.get("manifest_rel"):
+                shim["location"] = str(om / "manifests" / rc["manifest_rel"])
+        elif kind == "ms-dir":
+            ms = detector.cache_dir("modelscope")
+            org, _, _ = rc.get("repo_id", "").partition("/")
+            if ms and org and rc.get("dir_name"):
+                shim["location"] = str(ms / "models" / org / rc["dir_name"])
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}
