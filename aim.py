@@ -4058,31 +4058,37 @@ def _ms_read_native(repo_dir: Path) -> dict:
     return {"files": files, "dir_name": repo_dir.name}
 
 
-def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
-    """Replace the MS cache model dir with a directory symlink -> store, safely.
-    The original is renamed aside first; if creating the symlink fails it is restored,
-    so there is never a moment where both the original and the store copy could be lost."""
-    repo_dir.parent.mkdir(parents=True, exist_ok=True)
-    link = store_dir.resolve()
-    backup = repo_dir.parent / (repo_dir.name + ".aim-old")
+def _replace_with_symlink(orig: Path, target: Path) -> None:
+    """Replace `orig` (a file or dir) with a symlink -> target, safely: rename the original aside
+    (.aim-old) first; if creating the symlink fails, restore it; remove the backup on success.
+    There is never a moment where both the original and the store copy could be lost."""
+    orig = Path(orig)
+    orig.parent.mkdir(parents=True, exist_ok=True)
+    link = Path(target).resolve()
+    backup = orig.parent / (orig.name + ".aim-old")
     if backup.is_symlink() or backup.is_file():
         backup.unlink()
     elif backup.is_dir():
         shutil.rmtree(backup)
-    had_original = repo_dir.exists() or repo_dir.is_symlink()
+    had_original = orig.exists() or orig.is_symlink()
     if had_original:
-        os.rename(repo_dir, backup)            # original -> backup (atomic; original intact if this throws)
+        os.rename(orig, backup)
     try:
-        os.symlink(link, repo_dir)             # create the shim
+        os.symlink(link, orig)
     except OSError:
-        if had_original and not (repo_dir.exists() or repo_dir.is_symlink()):
-            os.rename(backup, repo_dir)        # restore original on failure
+        if had_original and not (orig.exists() or orig.is_symlink()):
+            os.rename(backup, orig)
         raise
     if had_original and (backup.exists() or backup.is_symlink()):
         if backup.is_dir() and not backup.is_symlink():
             shutil.rmtree(backup)
         else:
             backup.unlink()
+
+
+def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
+    """Replace the MS cache model dir with a directory symlink -> store (safe rename-aside)."""
+    _replace_with_symlink(repo_dir, store_dir)
 
 
 def _flatfile_read_native(file_path) -> dict:
@@ -4093,30 +4099,8 @@ def _flatfile_read_native(file_path) -> dict:
 
 
 def _flatfile_build_shim(orig_file: Path, store_file: Path) -> None:
-    """Replace a single cache file with a symlink -> store_file, safely (rename-aside + restore).
-    The original is renamed aside first; if creating the symlink fails it is restored."""
-    orig_file = Path(orig_file)
-    orig_file.parent.mkdir(parents=True, exist_ok=True)
-    link = store_file.resolve()
-    backup = orig_file.parent / (orig_file.name + ".aim-old")
-    if backup.is_symlink() or backup.is_file():
-        backup.unlink()
-    elif backup.is_dir():
-        shutil.rmtree(backup)
-    had_original = orig_file.exists() or orig_file.is_symlink()
-    if had_original:
-        os.rename(orig_file, backup)
-    try:
-        os.symlink(link, orig_file)
-    except OSError:
-        if had_original and not (orig_file.exists() or orig_file.is_symlink()):
-            os.rename(backup, orig_file)
-        raise
-    if had_original and (backup.exists() or backup.is_symlink()):
-        if backup.is_dir() and not backup.is_symlink():
-            shutil.rmtree(backup)
-        else:
-            backup.unlink()
+    """Replace a single cache file with a symlink -> store_file (safe rename-aside)."""
+    _replace_with_symlink(orig_file, store_file)
 
 
 def _ollama_models_root(manifest_path: Path) -> Path:
