@@ -51,6 +51,7 @@ CATEGORIES = [
 ENGINE_NAMES = [
     "ollama", "huggingface", "omlx", "comfyui", "whisper",
     "coqui", "sparktts", "piper", "fish-speech", "modelscope",
+    "pytorch-hub",
 ]
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
@@ -212,6 +213,7 @@ def default_config() -> dict:
             "piper":       {"enabled": True, "model_dir": "piper"},
             "fish-speech": {"enabled": True, "model_dir": "services/fish-speech"},
             "modelscope":  {"enabled": True, "model_dir": "modelscope", "native_cas": True},
+            "pytorch-hub": {"enabled": True, "model_dir": "torch/hub", "native_cas": True},
         },
         "sources": {},
         "env": {"managed": False, "shells": [], "files": {}},
@@ -1095,6 +1097,44 @@ class ModelScopeAdapter(EngineAdapter):
         return False
 
 
+class PyTorchHubAdapter(EngineAdapter):
+    name = "pytorch-hub"
+
+    def supported_formats(self) -> list[str]:
+        return ["pt", "pth"]
+
+    def scan(self) -> list[ScannedModel]:
+        results: list[ScannedModel] = []
+        ckpt = self.base_path / "checkpoints"
+        if not ckpt.is_dir():
+            return results
+        for f in sorted(ckpt.iterdir()):
+            if not f.is_file() or f.is_symlink() or f.suffix not in (".pt", ".pth"):
+                continue
+            stem = f.stem
+            results.append(ScannedModel(
+                id=self._make_id(f"torch-{stem}"), name=stem, path=str(f), engine=self.name,
+                format=f.suffix[1:], size_bytes=f.stat().st_size,
+                category=self._infer_cat(stem), tags=["pytorch-hub"],
+                source={"type": "pytorch-hub", "repo_id": stem},
+                native_cas=True, is_directory=False))
+        return results
+
+    def _infer_cat(self, name: str) -> str:
+        n = name.lower()
+        if any(k in n for k in ["wav2vec", "w2v", "whisper", "asr", "hubert", "wavlm", "conformer"]):
+            return "asr/model"
+        if "vad" in n:
+            return "audio/vad"
+        return "uncategorized"
+
+    def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
+        return []
+
+    def unprovision(self, model: ModelEntry) -> bool:
+        return False
+
+
 # Adapter registry
 ADAPTERS: dict[str, type[EngineAdapter]] = {
     "ollama": OllamaAdapter,
@@ -1107,6 +1147,7 @@ ADAPTERS: dict[str, type[EngineAdapter]] = {
     "piper": PiperAdapter,
     "fish-speech": FishSpeechAdapter,
     "modelscope": ModelScopeAdapter,
+    "pytorch-hub": PyTorchHubAdapter,
 }
 
 
@@ -1371,7 +1412,7 @@ SOURCES: dict[str, dict] = {
     },
     "pytorch-hub": {
         "aliases": ["torch", "pytorch"],
-        "cache_layout": "torch-hub",
+        "cache_layout": "flat-file",
         "tools": [
             {"name": "python3", "check": "which", "install_cmd": "brew install python",
              "description": "Python (torch.hub)"},

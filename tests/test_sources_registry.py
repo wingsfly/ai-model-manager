@@ -6,7 +6,7 @@ class SourcesRegistryTests(unittest.TestCase):
     ALLOWED_ROLES = {"cache_dir", "cache_dir_override", "endpoint", "token",
                      "accel", "proxy", "offline", "regen_cache", "misc"}
     ALLOWED_MANAGE = {"env_file", "native", "service", "none"}
-    ALLOWED_LAYOUT = {"cas-hf", "cas-ollama", "flat-ms", "torch-hub", "flat"}
+    ALLOWED_LAYOUT = {"cas-hf", "cas-ollama", "flat-ms", "torch-hub", "flat", "flat-file"}
 
     def test_all_expected_sources_present(self):
         for key in ["huggingface", "ollama", "modelscope", "url",
