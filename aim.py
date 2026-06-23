@@ -4748,6 +4748,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", dest="dry_run", action="store_true")
     p.add_argument("--json", dest="json_output", action="store_true")
 
+    p = sub.add_parser("backup", help="Back up store/ + a portable manifest to a directory")
+    p.add_argument("dest", help="Destination directory (external drive / another path)")
+    p.add_argument("--verify", action="store_true", help="Compare by quick-hash, not just size")
+    p.add_argument("--json", dest="json_output", action="store_true")
+
+    p = sub.add_parser("restore", help="Restore store/ + rebuild tool shims from a backup directory")
+    p.add_argument("src", help="Backup directory (containing aim-backup.json)")
+    p.add_argument("--root", dest="root_id", default="", help="Target storage root id (default: primary)")
+    p.add_argument("--apply-env", dest="apply_env", action="store_true", help="Also write env to shell config")
+    p.add_argument("--verify", action="store_true", help="Compare by quick-hash, not just size")
+    p.add_argument("--json", dest="json_output", action="store_true")
+
     # dedup
     p = sub.add_parser("dedup", help="Find/fix duplicate files")
     p.add_argument("--scan", action="store_true", dest="dedup_scan", help="Scan only")
@@ -5049,6 +5061,15 @@ def main() -> int:
                                       json_output=getattr(args, "json_output", False),
                                       auto_confirm=getattr(args, "auto_confirm", False))
         return op_sources_list(config, json_output=getattr(args, "json_output", False))
+
+    elif cmd == "backup":
+        return op_backup(config, registry, args.dest, verify=args.verify,
+                         json_output=args.json_output)
+
+    elif cmd == "restore":
+        return op_restore(config, registry, args.src, root_id=args.root_id,
+                          apply_env=args.apply_env, verify=args.verify,
+                          json_output=args.json_output)
 
     elif cmd == "config":
         if args.config_command == "show":
