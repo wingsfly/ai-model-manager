@@ -1342,7 +1342,7 @@ SOURCES: dict[str, dict] = {
         ],
         "env": [
             {"name": "OLLAMA_MODELS", "role": "cache_dir", "default": "~/.ollama/models",
-             "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
+             "subpath": "", "detect": ["env", "rc", "tool"], "manage": "service", "secret": False},
             {"name": "OLLAMA_HOST", "role": "endpoint", "default": "127.0.0.1:11434",
              "subpath": "", "detect": ["env", "rc"], "manage": "service", "secret": False},
         ],
@@ -1495,6 +1495,40 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
 # ── Sources & Env (SP1) ──────────────────────────────────────────────────────
 
 
+def _detect_ollama_models() -> Optional[str]:
+    """Find OLLAMA_MODELS set OUTSIDE the shell (macOS Ollama.app / a service manager).
+    Tries `launchctl getenv` first, then the running ollama server process's environment.
+    Returns the path or None. Best-effort; assumes the path has no spaces (model dirs rarely do)."""
+    try:
+        r = subprocess.run(["launchctl", "getenv", "OLLAMA_MODELS"],
+                           capture_output=True, text=True, timeout=5)
+        val = r.stdout.strip()
+        if val:
+            return val
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        pg = subprocess.run(["pgrep", "-f", "ollama"], capture_output=True, text=True, timeout=5)
+        for pid in pg.stdout.split():
+            ps = subprocess.run(["ps", "eww", pid], capture_output=True, text=True, timeout=5)
+            for tok in ps.stdout.split():
+                if tok.startswith("OLLAMA_MODELS="):
+                    val = tok.split("=", 1)[1]
+                    if val:
+                        return val
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _builtin_tool_probe(var: str, entry: dict) -> Optional[str]:
+    """Default `tool` detector used by EnvDetector when no probe is injected.
+    Currently resolves OLLAMA_MODELS from the ollama service when the shell doesn't set it."""
+    if var == "OLLAMA_MODELS":
+        return _detect_ollama_models()
+    return None
+
+
 class EnvDetector:
     """Read-only resolver for source env vars across shells/tools."""
 
@@ -1593,8 +1627,9 @@ class EnvDetector:
                 effective, source = live, "env"
         if effective is None and rc_hits:
             effective, source = rc_hits[0][1], f"rc:{rc_hits[0][0]}"
-        if effective is None and "tool" in detect and self._tool_probe:
-            tv = self._tool_probe(var, entry)
+        if effective is None and "tool" in detect:
+            probe = self._tool_probe or _builtin_tool_probe
+            tv = probe(var, entry)
             if tv:
                 effective, source = tv, "tool"
         recommended = self._recommended.get(var, "")
