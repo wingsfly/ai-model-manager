@@ -190,6 +190,26 @@ aim ingest <model_id> --new-id NEW --category CAT
 
 ---
 
+### aim backup / restore — 可移植备份与还原
+
+把整库备份到目录(外置盘/另一路径),并能在换机/换盘上一键还原。
+
+```bash
+aim backup <dir>            # 把 store/ 镜像到 <dir>/store/ + 写 <dir>/aim-backup.json(幂等、可重跑)
+aim backup <dir> --verify   # 用 quick-hash 比对(而非仅大小)
+aim restore <dir>           # 重建 store、导入 registry、为本机重算并重建 HF/Ollama/MS 加载壳;检测并打印建议 env
+aim restore <dir> --apply-env  # 额外把 env 写入 shell 配置
+aim restore <dir> --root <id>  # 还原到指定存储根(默认 primary)
+```
+
+**说明:**
+- 备份只含 store 真实字节 + 一个小 JSON 清单;**加载壳与各工具缓存不入备份**(还原时从 `storage` 标注重建),适合几百 GB 库换机/换盘。
+- 还原**按目标机的缓存路径重算壳位置**(读目标机 HF_HOME/OLLAMA_MODELS/MODELSCOPE_CACHE),所以源机与目标机路径不同也能正确落位。
+- 还原默认**不改 shell 配置**(只打印建议 env);`--apply-env` 才写。幂等可重跑;单个模型壳重建失败不中断整库还原、末尾汇总。
+- 若存在尚未 `aim ingest` 的原生模型,备份会告警(它们不在 store、不被备份)。
+
+---
+
 ### aim provision — 为引擎创建链接
 
 将 store 中的模型链接到引擎目录，使引擎可以直接使用。
