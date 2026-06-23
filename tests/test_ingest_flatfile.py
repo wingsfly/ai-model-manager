@@ -86,14 +86,15 @@ class FlatFileIngestTests(unittest.TestCase):
         self.assertTrue(ckpt.is_file() and not ckpt.is_symlink())
         self.assertEqual(reg.find("torch-wav2vec2").storage, {})
 
-    def test_ingest_rel_falls_back_when_cache_base_mismatch(self):
+    def test_ingest_rel_is_structural_regardless_of_cache_path(self):
         ckpt = _write(self.hub / "checkpoints" / "wav2vec2.pth", b"W" * 8)
-        self.config["sources"]["pytorch-hub"]["cache_path"] = "/totally/unrelated"  # not a parent of ckpt
+        self.config["sources"]["pytorch-hub"]["cache_path"] = "/totally/unrelated"  # must NOT affect rel
         reg = aim.Registry()
         reg.models = [self._torch_entry(ckpt)]
         ok = aim.op_ingest(self.config, reg, "torch-wav2vec2", registry_save=False)
-        self.assertTrue(ok)  # graceful: no crash
-        self.assertEqual(reg.find("torch-wav2vec2").storage["shims"][0]["reconstruct"]["rel"], "wav2vec2.pth")
+        self.assertTrue(ok)
+        self.assertEqual(reg.find("torch-wav2vec2").storage["shims"][0]["reconstruct"]["rel"],
+                         "checkpoints/wav2vec2.pth")
 
 
 class WhisperIngestTests(unittest.TestCase):

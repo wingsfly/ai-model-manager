@@ -1136,7 +1136,6 @@ class PyTorchHubAdapter(EngineAdapter):
         return False
 
 
-
 class WhisperCacheAdapter(EngineAdapter):
     name = "whisper-cache"
 
@@ -4433,12 +4432,9 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
                 shutil.rmtree(store_dir, ignore_errors=True)
             print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
             return False
-        cache_base_str = config.get("sources", {}).get(tool, {}).get("cache_path", "")
-        cache_base = Path(cache_base_str) if cache_base_str else EnvDetector().cache_dir(tool)
-        try:
-            rel = str(cache_repo.relative_to(cache_base)) if cache_base else fname
-        except ValueError:
-            rel = fname
+        # rel = path of the cache file relative to the source's cache_dir, derived structurally:
+        # torch checkpoints live under hub/checkpoints/; whisper .pt sits directly in the cache dir.
+        rel = f"checkpoints/{fname}" if tool == "pytorch-hub" else fname
         cls = "managed-torch" if tool == "pytorch-hub" else "managed-whisper"
         cache_root_var = "TORCH_HOME" if tool == "pytorch-hub" else "XDG_CACHE_HOME"
         entry.native_cas = False
