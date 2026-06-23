@@ -4371,6 +4371,9 @@ def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",
     if not root:
         print(f"Error: unknown root '{root_id}'", file=sys.stderr)
         return EXIT_INVALID_ARGS
+    if man.get("store_files") and not (backup_dir / "store").exists():
+        print(f"Warning: backup at {backup_dir} lists {len(man['store_files'])} store file(s) "
+              f"but has no store/ directory — restore may be incomplete.", file=sys.stderr)
     copied, skipped = _sync_store_dir(backup_dir / "store", root.store_path, verify=verify)
     det = detector or EnvDetector()
     rebuilt = 0

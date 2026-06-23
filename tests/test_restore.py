@@ -2,7 +2,7 @@ import unittest
 import json
 import tempfile
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 import aim
 
@@ -127,6 +127,21 @@ class RestoreRoundTripTests(unittest.TestCase):
         self.assertEqual(rc, aim.EXIT_FAILED)
         tgt_store = Path(tgt_cfg["roots"][0]["path"]) / "store" / "asr" / "model" / "hf-org-m"
         self.assertTrue((tgt_store / "model.safetensors").exists())
+
+
+class RestoreMalformedBackupTests(unittest.TestCase):
+    def test_warns_on_missing_store_dir(self):
+        home = Path(tempfile.mkdtemp())
+        cfg = aim.default_config(); cfg["roots"] = [{"id": "primary", "path": str(home / "AI")}]
+        bk = home / "bk"; bk.mkdir(parents=True)
+        (bk / "aim-backup.json").write_text(json.dumps({
+            "aim_backup_version": 1, "models": [], "sources": {}, "env": {},
+            "store_files": [{"path": "store/x", "size": 1, "quick_hash": "h"}]}))
+        # NOTE: no bk/store directory created
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            aim.op_restore(cfg, aim.Registry(), str(bk), registry_save=False)
+        self.assertIn("no store/ directory", err.getvalue())
 
 
 if __name__ == "__main__":
