@@ -83,7 +83,7 @@ class RestoreRoundTripTests(unittest.TestCase):
         det = aim.EnvDetector(home=tgt_home, rc_files=[],
                               shell_value=lambda v: str(tgt_hf) if v == "HF_HOME" else None)
         with redirect_stdout(io.StringIO()):
-            rc = aim.op_restore(tgt_cfg, tgt_reg, str(backup), detector=det)
+            rc = aim.op_restore(tgt_cfg, tgt_reg, str(backup), detector=det, registry_save=False)
         self.assertEqual(rc, aim.EXIT_OK)
         tgt_store = Path(tgt_cfg["roots"][0]["path"]) / "store" / "asr" / "model" / "hf-org-m"
         self.assertEqual((tgt_store / "model.safetensors").read_bytes(), b"W" * 40)
@@ -91,6 +91,8 @@ class RestoreRoundTripTests(unittest.TestCase):
         snaps = tgt_hf / "hub" / "models--Org--M" / "snapshots"
         snap = next(d for d in snaps.iterdir() if d.is_dir())
         self.assertEqual((snap / "model.safetensors").resolve().read_bytes(), b"W" * 40)
+        self.assertTrue(str(snap.resolve()).startswith(str(tgt_home.resolve())))   # shim -> target store, not source
+        self.assertFalse(str(snap.resolve()).startswith(str(src_home.resolve())))
 
     def test_restore_idempotent(self):
         src_home, src_cfg, src_reg = self._ingest_source()
@@ -102,8 +104,8 @@ class RestoreRoundTripTests(unittest.TestCase):
         det = aim.EnvDetector(home=tgt_home, rc_files=[],
                               shell_value=lambda v: str(tgt_home / "hf") if v == "HF_HOME" else None)
         with redirect_stdout(io.StringIO()):
-            aim.op_restore(tgt_cfg, aim.Registry(), str(backup), detector=det)
-            rc = aim.op_restore(tgt_cfg, aim.Registry(), str(backup), detector=det)
+            aim.op_restore(tgt_cfg, aim.Registry(), str(backup), detector=det, registry_save=False)
+            rc = aim.op_restore(tgt_cfg, aim.Registry(), str(backup), detector=det, registry_save=False)
         self.assertEqual(rc, aim.EXIT_OK)
 
     def test_restore_continues_on_shim_failure(self):
@@ -119,7 +121,7 @@ class RestoreRoundTripTests(unittest.TestCase):
         aim._rebuild_shim_from_storage = lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))
         try:
             with redirect_stdout(io.StringIO()):
-                rc = aim.op_restore(tgt_cfg, aim.Registry(), str(backup), detector=det)
+                rc = aim.op_restore(tgt_cfg, aim.Registry(), str(backup), detector=det, registry_save=False)
         finally:
             aim._rebuild_shim_from_storage = orig
         self.assertEqual(rc, aim.EXIT_FAILED)

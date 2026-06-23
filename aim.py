@@ -4358,7 +4358,7 @@ def _retarget_shim_locations(entry: "ModelEntry", detector: "EnvDetector") -> No
 
 
 def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",
-               apply_env: bool = False, verify: bool = False,
+               apply_env: bool = False, verify: bool = False, registry_save: bool = True,
                detector: Optional["EnvDetector"] = None, json_output: bool = False) -> int:
     backup_dir = Path(src).expanduser()
     try:
@@ -4387,11 +4387,13 @@ def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",
             except Exception as ex:
                 errors.append((entry.id, str(ex)))
         registry.add(entry)
-    registry.save()
     csources = config.setdefault("sources", {})
     for k, v in man.get("sources", {}).items():
         if isinstance(v, dict) and v.get("managed_env"):
             csources.setdefault(k, {}).setdefault("managed_env", {}).update(v["managed_env"])
+    if registry_save:
+        registry.save()
+        save_config(config)
     if apply_env:
         op_env_apply(config, registry)
         print("Applied env to shell config.")
