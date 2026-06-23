@@ -4310,7 +4310,7 @@ def op_backup(config: dict, registry: "Registry", dest: str, verify: bool = Fals
     dest_dir = Path(dest).expanduser()
     dest_dir.mkdir(parents=True, exist_ok=True)
     native = [m.id for m in registry.models if m.native_cas]
-    if native:
+    if native and not json_output:
         shown = ", ".join(native[:5]) + (" ..." if len(native) > 5 else "")
         print(f"Warning: {len(native)} native model(s) not ingested (not in store, won't be backed up): {shown}")
         print("  Run 'aim ingest --all-native' first to include them.")
@@ -4396,8 +4396,9 @@ def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",
         save_config(config)
     if apply_env:
         op_env_apply(config, registry)
-        print("Applied env to shell config.")
-    else:
+        if not json_output:
+            print("Applied env to shell config.")
+    elif not json_output:
         print("Recommended: run 'aim env apply' to set tool env vars on this machine.")
     for mid, err in errors:
         print(f"  shim rebuild failed for {mid}: {err}", file=sys.stderr)
@@ -4751,14 +4752,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("backup", help="Back up store/ + a portable manifest to a directory")
     p.add_argument("dest", help="Destination directory (external drive / another path)")
     p.add_argument("--verify", action="store_true", help="Compare by quick-hash, not just size")
-    p.add_argument("--json", dest="json_output", action="store_true")
+    p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
 
     p = sub.add_parser("restore", help="Restore store/ + rebuild tool shims from a backup directory")
     p.add_argument("src", help="Backup directory (containing aim-backup.json)")
     p.add_argument("--root", dest="root_id", default="", help="Target storage root id (default: primary)")
     p.add_argument("--apply-env", dest="apply_env", action="store_true", help="Also write env to shell config")
     p.add_argument("--verify", action="store_true", help="Compare by quick-hash, not just size")
-    p.add_argument("--json", dest="json_output", action="store_true")
+    p.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
 
     # dedup
     p = sub.add_parser("dedup", help="Find/fix duplicate files")
