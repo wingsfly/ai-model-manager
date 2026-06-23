@@ -4429,9 +4429,10 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
                 shutil.rmtree(store_dir, ignore_errors=True)
             print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
             return False
-        cache_base = Path(config.get("sources", {}).get(tool, {}).get("cache_path", ""))
+        cache_base_str = config.get("sources", {}).get(tool, {}).get("cache_path", "")
+        cache_base = Path(cache_base_str) if cache_base_str else EnvDetector().cache_dir(tool)
         try:
-            rel = str(cache_repo.relative_to(cache_base)) if str(cache_base) else fname
+            rel = str(cache_repo.relative_to(cache_base)) if cache_base else fname
         except ValueError:
             rel = fname
         cls = "managed-torch" if tool == "pytorch-hub" else "managed-whisper"
