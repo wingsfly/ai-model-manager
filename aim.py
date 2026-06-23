@@ -50,7 +50,7 @@ CATEGORIES = [
 
 ENGINE_NAMES = [
     "ollama", "huggingface", "omlx", "comfyui", "whisper",
-    "coqui", "sparktts", "piper", "fish-speech",
+    "coqui", "sparktts", "piper", "fish-speech", "modelscope",
 ]
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
@@ -105,6 +105,10 @@ class ModelEntry:
     # "symlink"|"hardlink"|"reference"}. Surfaced by info/verify, warned on delete,
     # re-pointed on migrate. Registered via `aim link` (manually or --scan).
     external_links: list[dict] = field(default_factory=list)
+    # SP2: how this model is physically stored + how each tool loads it (shims).
+    # {"class": "managed-hf|managed-ollama|managed-ms|managed-flat",
+    #  "store_path": "<relative-to-root>", "ingested_at": str, "shims": [ {...} ]}
+    storage: dict = field(default_factory=dict)
     added_at: str = ""
 
     def to_dict(self) -> dict:
@@ -207,6 +211,7 @@ def default_config() -> dict:
             "sparktts":    {"enabled": True, "model_dir": "sparktts/pretrained_models"},
             "piper":       {"enabled": True, "model_dir": "piper"},
             "fish-speech": {"enabled": True, "model_dir": "services/fish-speech"},
+            "modelscope":  {"enabled": True, "model_dir": "modelscope", "native_cas": True},
         },
         "sources": {},
         "env": {"managed": False, "shells": [], "files": {}},
@@ -1037,6 +1042,59 @@ class FishSpeechAdapter(EngineAdapter):
         return True
 
 
+class ModelScopeAdapter(EngineAdapter):
+    name = "modelscope"
+
+    def supported_formats(self) -> list[str]:
+        return ["safetensors", "bin", "pt", "gguf"]
+
+    def scan(self) -> list[ScannedModel]:
+        results: list[ScannedModel] = []
+        base = self.base_path
+        for layout_root in (base / "models", base / "hub" / "models"):
+            if not layout_root.exists():
+                continue
+            for org_dir in sorted(layout_root.iterdir()):
+                if not org_dir.is_dir() or org_dir.name.startswith((".", "_")):
+                    continue
+                for repo_dir in sorted(org_dir.iterdir()):
+                    if repo_dir.is_symlink() or not repo_dir.is_dir() or repo_dir.name.startswith((".", "_")):
+                        continue
+                    if not any(f.is_file() and not f.name.startswith(".") for f in repo_dir.rglob("*")):
+                        continue
+                    repo_name = repo_dir.name.replace("___", ".")
+                    repo_id = f"{org_dir.name}/{repo_name}"
+                    fmt = ""
+                    for f in repo_dir.iterdir():
+                        if f.suffix == ".safetensors" and f.is_file():
+                            fmt = "safetensors"; break
+                        if f.suffix in (".bin", ".pt", ".gguf") and f.is_file():
+                            fmt = fmt or f.suffix[1:]
+                    results.append(ScannedModel(
+                        id=self._make_id(f"ms-{org_dir.name}-{repo_name}"),
+                        name=repo_id, path=str(repo_dir), engine=self.name, format=fmt,
+                        size_bytes=self._dir_size(repo_dir),
+                        category=self._infer_ms_category(repo_id),
+                        tags=["modelscope", org_dir.name],
+                        source={"type": "modelscope", "repo_id": repo_id},
+                        native_cas=True, is_directory=True))
+        return results
+
+    def _infer_ms_category(self, repo_id: str) -> str:
+        rl = repo_id.lower()
+        if any(k in rl for k in ["asr", "paraformer", "whisper", "sensevoice", "firered"]):
+            return "asr/model"
+        if any(k in rl for k in ["tts", "vocoder"]):
+            return "tts/model"
+        return "llm/chat"
+
+    def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
+        return []
+
+    def unprovision(self, model: ModelEntry) -> bool:
+        return False
+
+
 # Adapter registry
 ADAPTERS: dict[str, type[EngineAdapter]] = {
     "ollama": OllamaAdapter,
@@ -1048,6 +1106,7 @@ ADAPTERS: dict[str, type[EngineAdapter]] = {
     "sparktts": SparkTTSAdapter,
     "piper": PiperAdapter,
     "fish-speech": FishSpeechAdapter,
+    "modelscope": ModelScopeAdapter,
 }
 
 
@@ -3301,114 +3360,12 @@ def op_convert_native_to_store(
     keep_native: bool = True,
     json_output: bool = False,
 ) -> bool:
-    """Convert native CAS model into managed store model."""
-    entry = registry.find(model_id)
-    if not entry:
-        msg = f"Model '{model_id}' not found."
-        if json_output:
-            print(json.dumps({"error": {"code": "MODEL_NOT_FOUND", "message": msg, "retryable": False}}, ensure_ascii=False))
-        else:
-            print(f"Error: {msg}")
-        return False
-    if not entry.native_cas:
-        msg = f"Model '{model_id}' is already managed (native_cas=false)."
-        if json_output:
-            print(json.dumps({"error": {"code": "NOT_NATIVE_CAS", "message": msg, "retryable": False}}, ensure_ascii=False))
-        else:
-            print(f"Error: {msg}")
-        return False
-
-    roots = {r.id: r for r in get_roots(config)}
-    src_root = roots.get(entry.canonical.get("root", "primary")) or get_primary_root(config)
-    src_rel = entry.canonical.get("path", "")
-    src_path = Path(src_rel)
-    if not src_path.is_absolute():
-        src_path = Path(src_root.path) / src_rel
-    src_path = src_path.resolve()
-    if not src_path.exists():
-        msg = f"Source path does not exist: {src_path}"
-        if json_output:
-            print(json.dumps({"error": {"code": "SOURCE_PATH_NOT_FOUND", "message": msg, "retryable": False}}, ensure_ascii=False))
-        else:
-            print(f"Error: {msg}")
-        return False
-
-    dst_root = get_primary_root(config)
-    target_id = _sanitize_model_id(new_id or entry.id)
-    target_category = category or entry.category or _infer_download_category(entry.source, target_id, explicit_category="")
-    dst_path = (dst_root.store_path / target_category / target_id).resolve()
-
-    if dst_path.exists():
-        msg = f"Destination already exists: {dst_path}"
-        if json_output:
-            print(json.dumps({"error": {"code": "DEST_EXISTS", "message": msg, "retryable": False}}, ensure_ascii=False))
-        else:
-            print(f"Error: {msg}")
-        return False
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if mode == "move" and not keep_native:
-            shutil.move(str(src_path), str(dst_path))
-        else:
-            if src_path.is_dir():
-                shutil.copytree(src_path, dst_path)
-            else:
-                shutil.copy2(src_path, dst_path)
-        if mode == "copy" and not keep_native:
-            if src_path.is_dir():
-                shutil.rmtree(src_path)
-            else:
-                src_path.unlink(missing_ok=True)
-    except OSError as e:
-        msg = f"Conversion failed: {e}"
-        if json_output:
-            print(json.dumps({"error": {"code": "CONVERT_FAILED", "message": msg, "retryable": False}}, ensure_ascii=False))
-        else:
-            print(f"Error: {msg}")
-        return False
-
-    size_bytes, fmt = _compute_path_stats(dst_path)
-    managed_entry = copy.deepcopy(entry)
-    managed_entry.id = target_id
-    managed_entry.name = managed_entry.name or target_id
-    managed_entry.category = target_category
-    managed_entry.format = fmt or managed_entry.format
-    managed_entry.size_bytes = size_bytes
-    managed_entry.native_cas = False
-    try:
-        canonical_path = str(dst_path.relative_to(Path(dst_root.path).resolve()))
-    except ValueError:
-        canonical_path = str(dst_path)
-    managed_entry.canonical = {
-        "root": dst_root.id,
-        "path": canonical_path,
-    }
-    managed_entry.provisions = []
-    managed_entry.added_at = datetime.now(timezone.utc).isoformat()
-    managed_entry.source = copy.deepcopy(entry.source) if entry.source else {"type": "local", "repo_id": target_id}
-
-    registry.add(managed_entry)
-    if target_id != entry.id and not keep_native:
-        registry.remove(entry.id)
-    registry.save()
-
-    out = {
-        "status": "converted",
-        "from_model_id": model_id,
-        "model_id": target_id,
-        "path": str(dst_path),
-        "category": target_category,
-        "size_bytes": size_bytes,
-        "mode": mode,
-        "keep_native": keep_native,
-    }
-    if json_output:
-        print(json.dumps(out, ensure_ascii=False))
-    else:
-        print(f"Converted: {model_id} -> {target_id}")
-        print(f"Path: {dst_path}")
-    return True
+    """Deprecated: delegates to op_ingest (correct flat ingest + shim + annotation).
+    The `mode` parameter is ignored (ingest always copies/hard-links flat)."""
+    if not json_output:
+        print("Note: 'aim convert' is deprecated; use 'aim ingest'. Delegating to ingest...")
+    return op_ingest(config, registry, model_id, new_id=new_id, category=category,
+                     keep_native=keep_native, json_output=json_output)
 
 
 def op_dedup(config: dict, registry: Registry, scan_only: bool = True) -> list[dict]:
@@ -3575,6 +3532,17 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
                                    "error": "external_wrong_target", "path": str(ext),
                                    "actual": str(real), "expected_under": str(canonical)})
 
+    # SP2: verify storage shims resolve; rebuild from annotation with --fix.
+    for m in registry.models:
+        st = getattr(m, "storage", {}) or {}
+        if not st.get("shims"):
+            continue
+        for shim in st["shims"]:
+            loc = shim["location"]
+            cache_path = Path(loc) if os.path.isabs(loc) else (Path(get_primary_root(config).path) / loc)
+            if not (cache_path.exists() or cache_path.is_symlink()):
+                issues.append({"model": m.id, "error": "shim_missing", "path": str(cache_path)})
+
     if not issues:
         print("All links verified OK.")
         return []
@@ -3600,6 +3568,15 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
                             lt,
                         )
                         print(f"  Fixed: {target}")
+            elif issue.get("error") == "shim_missing":
+                model_id = issue["model"]
+                model = registry.find(model_id)
+                if model:
+                    try:
+                        if _rebuild_shim_from_storage(config, model):
+                            print(f"  Rebuilt shim for {model_id}")
+                    except Exception as ex:
+                        print(f"  Could not rebuild shim for {model_id}: {ex}")
 
     return issues
 
@@ -3899,6 +3876,382 @@ def op_root_list(config: dict) -> None:
             except OSError:
                 pass
         print(f"{r['id']:<15} {r.get('label', ''):<20} {r['path']:<40} {used:<12} {free:<12}")
+
+
+# ── Native Ingest (SP2) ──────────────────────────────────────────────────────
+
+
+def _hf_read_native(repo_dir: Path) -> dict:
+    """Read a HuggingFace cache repo dir (models--org--repo) to reconstruct metadata.
+    Returns {repo_id, commit, files: [{name, real_path, size}]} using the current snapshot."""
+    parts = repo_dir.name.split("--", 2)
+    repo_id = f"{parts[1]}/{parts[2]}" if len(parts) == 3 else repo_dir.name
+    refs_main = repo_dir / "refs" / "main"
+    commit = refs_main.read_text().strip() if refs_main.exists() else ""
+    snap = repo_dir / "snapshots" / commit
+    if not commit or not snap.is_dir():
+        snaps_dir = repo_dir / "snapshots"
+        snaps = [d for d in snaps_dir.iterdir() if d.is_dir()] if snaps_dir.exists() else []
+        if snaps:
+            snap = snaps[0]
+            commit = commit or snap.name
+    files = []
+    if commit and snap.is_dir():
+        for f in sorted(snap.rglob("*")):
+            real = f.resolve()
+            if real.is_file():
+                files.append({"name": str(f.relative_to(snap)), "real_path": str(real),
+                              "size": real.stat().st_size})
+    return {"repo_id": repo_id, "commit": commit, "files": files}
+
+
+def _ingest_to_store(files: list, dest: Path) -> int:
+    """Copy each real file flat into dest/<name>. Returns total bytes. No CAS structure copied."""
+    dest.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for f in files:
+        target = dest / f["name"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f["real_path"], target)
+        total += target.stat().st_size
+    return total
+
+
+def _hf_build_shim(repo_dir: Path, store_dir: Path, commit: str, files: list) -> None:
+    """Rebuild snapshots/<commit> as absolute symlinks into store, atomically via a temp dir.
+    Does NOT touch blobs/ (caller removes them only after the shim is built, gated on keep_native).
+    On failure the original snapshot dir is left intact (temp dir is swapped in only on success)."""
+    (repo_dir / "refs").mkdir(parents=True, exist_ok=True)
+    snap = repo_dir / "snapshots" / commit
+    tmp = repo_dir / "snapshots" / (commit + ".aim-tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        target = tmp / f["name"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink((store_dir / f["name"]).resolve(), target)
+    if snap.exists() or snap.is_symlink():
+        shutil.rmtree(snap)
+    tmp.rename(snap)
+    (repo_dir / "refs" / "main").write_text(commit)
+
+
+def _ms_read_native(repo_dir: Path) -> dict:
+    files = []
+    for f in sorted(repo_dir.rglob("*")):
+        if f.is_file() and not f.is_symlink():
+            files.append({"name": str(f.relative_to(repo_dir)), "real_path": str(f),
+                          "size": f.stat().st_size})
+    return {"files": files, "dir_name": repo_dir.name}
+
+
+def _ms_build_shim(repo_dir: Path, store_dir: Path) -> None:
+    """Replace the MS cache model dir with a directory symlink -> store, safely.
+    The original is renamed aside first; if creating the symlink fails it is restored,
+    so there is never a moment where both the original and the store copy could be lost."""
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+    link = store_dir.resolve()
+    backup = repo_dir.parent / (repo_dir.name + ".aim-old")
+    if backup.is_symlink() or backup.is_file():
+        backup.unlink()
+    elif backup.is_dir():
+        shutil.rmtree(backup)
+    had_original = repo_dir.exists() or repo_dir.is_symlink()
+    if had_original:
+        os.rename(repo_dir, backup)            # original -> backup (atomic; original intact if this throws)
+    try:
+        os.symlink(link, repo_dir)             # create the shim
+    except OSError:
+        if had_original and not (repo_dir.exists() or repo_dir.is_symlink()):
+            os.rename(backup, repo_dir)        # restore original on failure
+        raise
+    if had_original and (backup.exists() or backup.is_symlink()):
+        if backup.is_dir() and not backup.is_symlink():
+            shutil.rmtree(backup)
+        else:
+            backup.unlink()
+
+
+def _ollama_models_root(manifest_path: Path) -> Path:
+    """Given .../manifests/<reg>/<ns>/<model>/<tag>, return the dir containing manifests/ and blobs/."""
+    p = manifest_path
+    while p.parent != p and p.name != "manifests":
+        p = p.parent
+    if p.name != "manifests":
+        raise ValueError(f"no 'manifests/' ancestor in {manifest_path}")
+    return p.parent
+
+
+def _ollama_read_native(manifest_path: Path, models_root: Path) -> dict:
+    """Parse an ollama manifest into reconstruct metadata. On-disk blob files use 'sha256-<hex>'
+    (dash); manifests reference 'sha256:<hex>' (colon). We expose dash-form digests + real paths,
+    but keep the raw manifest (colon form) for exact round-trip."""
+    manifest = json.loads(manifest_path.read_text())
+    blobs_dir = models_root / "blobs"
+    layers = list(manifest.get("layers", []))
+    cfg = manifest.get("config")
+    gguf_layer = max(layers, key=lambda l: l.get("size", 0)) if layers else None
+    small = [l for l in layers if l is not gguf_layer]
+    if cfg:
+        small.append(cfg)
+
+    def disk(d: str) -> str:
+        return d.replace(":", "-")
+
+    rel = manifest_path.relative_to(models_root / "manifests")
+    parts = rel.parts
+    model = parts[-2] if len(parts) >= 2 else manifest_path.parent.name
+    tag = parts[-1]
+    return {
+        "model": model, "tag": tag, "manifest": manifest, "manifest_rel": str(rel),
+        "gguf": {"digest": disk(gguf_layer["digest"]),
+                 "real_path": str(blobs_dir / disk(gguf_layer["digest"])),
+                 "size": gguf_layer.get("size", 0)} if gguf_layer else None,
+        "small_blobs": [{"digest": disk(b["digest"]),
+                         "real_path": str(blobs_dir / disk(b["digest"])),
+                         "size": b.get("size", 0)} for b in small],
+    }
+
+
+def _ollama_build_shim(info: dict, store_dir: Path, models_root: Path) -> None:
+    """Rebuild a MISSING ollama cache from store (verify --fix / restore direction):
+    hardlink the GGUF blob from store, copy small blobs, write the manifest."""
+    if not info.get("gguf"):
+        raise ValueError("ollama build_shim: manifest info has no GGUF layer")
+    blobs_dir = models_root / "blobs"
+    blobs_dir.mkdir(parents=True, exist_ok=True)
+    store_gguf = store_dir / f"{store_dir.name}.gguf"
+    gguf_blob = blobs_dir / info["gguf"]["digest"]
+    if gguf_blob.exists() or gguf_blob.is_symlink():
+        gguf_blob.unlink()
+    if LinkManager.same_volume(store_gguf, gguf_blob):
+        os.link(store_gguf, gguf_blob)
+    else:
+        shutil.copy2(store_gguf, gguf_blob)
+    for b in info["small_blobs"]:
+        sb = blobs_dir / b["digest"]
+        if not sb.exists():
+            src = store_dir / f"blob-{b['digest']}"
+            if src.exists():
+                shutil.copy2(src, sb)
+    man_path = models_root / "manifests" / Path(info["manifest_rel"])
+    man_path.parent.mkdir(parents=True, exist_ok=True)
+    man_path.write_text(json.dumps(info["manifest"]))
+
+
+def _sanitize_ingest_id(entry: "ModelEntry", new_id: str) -> str:
+    return _sanitize_model_id(new_id) if new_id else entry.id
+
+
+def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
+    """Rebuild a model's load shim(s) from its storage annotation. Returns True if rebuilt."""
+    storage = entry.storage or {}
+    if not storage.get("shims"):
+        return False
+    root = get_primary_root(config)
+    store_dir = Path(root.path) / storage.get("store_path", "")
+    rebuilt = False
+    for shim in storage["shims"]:
+        loc = shim["location"]
+        cache_path = Path(loc) if os.path.isabs(loc) else (Path(root.path) / loc)
+        rc = shim.get("reconstruct", {})
+        if shim["kind"] == "hf-cas":
+            files = [{"name": n} for n in rc.get("files", [])]
+            _hf_build_shim(cache_path, store_dir, rc.get("commit", ""), files)
+            rebuilt = True
+        elif shim["kind"] == "ms-dir":
+            _ms_build_shim(cache_path, store_dir)
+            rebuilt = True
+        elif shim["kind"] == "ollama-cas":
+            models_root = _ollama_models_root(cache_path)
+            info = {"gguf": {"digest": rc.get("gguf_digest", "")},
+                    "small_blobs": [{"digest": d} for d in rc.get("small_blobs", [])],
+                    "manifest": rc.get("manifest", {}),
+                    "manifest_rel": rc.get("manifest_rel", "")}
+            _ollama_build_shim(info, store_dir, models_root)
+            rebuilt = True
+    return rebuilt
+
+
+def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "",
+              category: str = "", dry_run: bool = False, keep_native: bool = False,
+              registry_save: bool = True, json_output: bool = False) -> bool:
+    """Ingest a native-CAS model into the flat store + rebuild its load shim + annotate."""
+    entry = registry.find(model_id)
+    if not entry:
+        print(f"Error: model '{model_id}' not found.", file=sys.stderr)
+        return False
+    if not entry.native_cas:
+        print(f"Error: '{model_id}' is already managed (native_cas=false).", file=sys.stderr)
+        return False
+    tool = entry.source.get("type", "")
+    root = get_primary_root(config)
+    cache_repo = Path(entry.canonical.get("path", ""))
+    if not cache_repo.is_absolute():
+        cache_repo = Path(root.path) / entry.canonical.get("path", "")
+
+    if tool == "huggingface":
+        info = _hf_read_native(cache_repo)
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "uncategorized"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} ({len(info['files'])} files) -> {store_rel}, "
+                  f"rebuild HF shim at {cache_repo}")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            size = _ingest_to_store(info["files"], store_dir)
+            _hf_build_shim(cache_repo, store_dir, info["commit"], info["files"])
+            if not keep_native:
+                blobs = cache_repo / "blobs"
+                if blobs.exists():
+                    shutil.rmtree(blobs)
+        except OSError as ex:
+            if store_dir.exists():
+                shutil.rmtree(store_dir, ignore_errors=True)
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": "managed-hf", "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": "huggingface", "kind": "hf-cas",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
+                "cache_root_var": "HF_HOME",
+                "reconstruct": {"repo_id": info["repo_id"], "commit": info["commit"],
+                                "files": [f["name"] for f in info["files"]]},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
+    if tool == "modelscope":
+        info = _ms_read_native(cache_repo)
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "uncategorized"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} ({len(info['files'])} files) -> {store_rel}, "
+                  f"replace MS dir {cache_repo} with symlink")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            size = _ingest_to_store(info["files"], store_dir)
+            _ms_build_shim(cache_repo, store_dir)
+        except OSError as ex:
+            if store_dir.exists():
+                shutil.rmtree(store_dir, ignore_errors=True)
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": "managed-ms", "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": "modelscope", "kind": "ms-dir",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
+                "cache_root_var": "MODELSCOPE_CACHE",
+                "reconstruct": {"repo_id": entry.source.get("repo_id", ""), "dir_name": info["dir_name"]},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
+    if tool == "ollama":
+        models_root = _ollama_models_root(cache_repo)
+        info = _ollama_read_native(cache_repo, models_root)
+        if not info["gguf"]:
+            print(f"Error: no GGUF layer in {model_id}", file=sys.stderr)
+            return False
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "llm/chat"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} (gguf {info['gguf']['size']}B) -> {store_rel}, "
+                  f"hardlink blob into store (ollama cache left intact)")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            store_dir.mkdir(parents=True, exist_ok=True)
+            store_gguf = store_dir / f"{target_id}.gguf"
+            gguf_blob = Path(info["gguf"]["real_path"])
+            # keep_native is moot for ollama: the cache is never deleted (GGUF shared via inode).
+            if LinkManager.same_volume(gguf_blob, store_gguf):
+                os.link(gguf_blob, store_gguf)        # share inode; cache blob untouched
+            else:
+                shutil.copy2(gguf_blob, store_gguf)
+            for b in info["small_blobs"]:
+                shutil.copy2(b["real_path"], store_dir / f"blob-{b['digest']}")
+            (store_dir / "manifest.json").write_text(json.dumps(info["manifest"]))
+            size = sum(p.stat().st_size for p in store_dir.rglob("*") if p.is_file())
+        except OSError as ex:
+            shutil.rmtree(store_dir, ignore_errors=True)   # safe: ollama cache untouched
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.format = "gguf"
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": "managed-ollama", "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": "ollama", "kind": "ollama-cas",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
+                "cache_root_var": "OLLAMA_MODELS",
+                "reconstruct": {"model": info["model"], "tag": info["tag"], "manifest": info["manifest"],
+                                "manifest_rel": info["manifest_rel"],
+                                "gguf_digest": info["gguf"]["digest"],
+                                "small_blobs": [b["digest"] for b in info["small_blobs"]]},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
+    print(f"Error: ingest not yet implemented for source type '{tool}'.", file=sys.stderr)
+    return False
+
+
+def op_ingest_all(config: dict, registry: "Registry", dry_run: bool = False,
+                  keep_native: bool = False, registry_save: bool = True) -> int:
+    native = [m.id for m in list(registry.models) if m.native_cas]
+    done = 0
+    for mid in native:
+        if op_ingest(config, registry, mid, dry_run=dry_run, keep_native=keep_native,
+                     registry_save=False):
+            done += 1
+    if registry_save and not dry_run:
+        registry.save()
+    print(f"Ingested {done}/{len(native)} native model(s).")
+    return done
 
 
 # ── Path Resolution ────────────────────────────────────────────────────────
@@ -4228,6 +4581,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-keep-native", action="store_false", dest="keep_native", help="Remove native source files after convert")
     p.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
 
+    # ingest
+    p = sub.add_parser("ingest", help="Ingest a native-CAS model into the store + rebuild its load shim")
+    p.add_argument("model_id", nargs="?", default="", help="Model id (omit with --all-native)")
+    p.add_argument("--all-native", dest="all_native", action="store_true", help="Ingest all native_cas models")
+    p.add_argument("--new-id", dest="new_id", default="", help="Rename on ingest")
+    p.add_argument("--category", default="", help="Override category")
+    p.add_argument("--keep-native", dest="keep_native", action="store_true", help="Keep original native bytes")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true")
+    p.add_argument("--json", dest="json_output", action="store_true")
+
     # dedup
     p = sub.add_parser("dedup", help="Find/fix duplicate files")
     p.add_argument("--scan", action="store_true", dest="dedup_scan", help="Scan only")
@@ -4484,6 +4847,18 @@ def main() -> int:
             keep_native=args.keep_native,
             json_output=args.json_output,
         )
+        return EXIT_OK if ok else EXIT_FAILED
+
+    elif cmd == "ingest":
+        if getattr(args, "all_native", False):
+            op_ingest_all(config, registry, dry_run=args.dry_run, keep_native=args.keep_native)
+            return EXIT_OK
+        if not args.model_id:
+            print("Usage: aim ingest <model_id> | --all-native", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        ok = op_ingest(config, registry, args.model_id, new_id=args.new_id,
+                       category=args.category, dry_run=args.dry_run,
+                       keep_native=args.keep_native, json_output=args.json_output)
         return EXIT_OK if ok else EXIT_FAILED
 
     elif cmd == "dedup":
