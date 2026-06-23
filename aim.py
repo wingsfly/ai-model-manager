@@ -1495,35 +1495,71 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
 # ── Sources & Env (SP1) ──────────────────────────────────────────────────────
 
 
+def _parse_env_token_line(text: str, var: str) -> Optional[str]:
+    """Find VAR=value in a whitespace-separated env dump (e.g. `ps eww` output).
+    Whitespace-split, so a value containing spaces may be missed (acceptable for `ps`)."""
+    prefix = var + "="
+    for tok in text.split():
+        if tok.startswith(prefix):
+            return tok[len(prefix):] or None
+    return None
+
+
+def _parse_environ_bytes(data: bytes, var: str) -> Optional[str]:
+    """Find VAR=value in NUL-delimited /proc/<pid>/environ bytes (space-safe)."""
+    prefix = (var + "=").encode()
+    for entry in data.split(b"\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix):].decode("utf-8", "replace") or None
+    return None
+
+
+def _pid_env_value(pid: str, var: str) -> Optional[str]:
+    """Read one env var from a single process's environment. Linux: /proc/<pid>/environ
+    (NUL-delimited, space-safe); else `ps eww <pid>`. Returns None (never raises) on any failure."""
+    environ = Path("/proc") / pid / "environ"
+    try:
+        if environ.exists():
+            return _parse_environ_bytes(environ.read_bytes(), var)
+    except OSError:
+        return None
+    try:
+        ps = subprocess.run(["ps", "eww", pid], capture_output=True, text=True,
+                            timeout=5, errors="replace")
+        return _parse_env_token_line(ps.stdout, var)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def _detect_ollama_models() -> Optional[str]:
     """Find OLLAMA_MODELS set OUTSIDE the shell (macOS Ollama.app / a service manager).
-    Tries `launchctl getenv` first, then the running ollama server process's environment.
-    Returns the path or None. Best-effort; assumes the path has no spaces (model dirs rarely do)."""
+    On macOS tries `launchctl getenv` first; on any platform falls back to reading the running
+    ollama server process environment (Linux: /proc/<pid>/environ; macOS/BSD: `ps eww`).
+    Returns the path or None; never raises (best-effort)."""
     try:
         r = subprocess.run(["launchctl", "getenv", "OLLAMA_MODELS"],
-                           capture_output=True, text=True, timeout=5)
-        val = r.stdout.strip()
-        if val:
-            return val
-    except (OSError, subprocess.SubprocessError):
+                           capture_output=True, text=True, timeout=5, errors="replace")
+        if r.stdout.strip():
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
         pass
     try:
-        pg = subprocess.run(["pgrep", "-f", "ollama"], capture_output=True, text=True, timeout=5)
-        for pid in pg.stdout.split():
-            ps = subprocess.run(["ps", "eww", pid], capture_output=True, text=True, timeout=5)
-            for tok in ps.stdout.split():
-                if tok.startswith("OLLAMA_MODELS="):
-                    val = tok.split("=", 1)[1]
-                    if val:
-                        return val
-    except (OSError, subprocess.SubprocessError):
-        pass
+        pg = subprocess.run(["pgrep", "-f", "ollama"], capture_output=True, text=True,
+                            timeout=5, errors="replace")
+        pids = pg.stdout.split()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pids = []
+    for pid in pids:
+        val = _pid_env_value(pid, "OLLAMA_MODELS")  # per-PID isolated; a bad PID is skipped
+        if val:
+            return val
     return None
 
 
 def _builtin_tool_probe(var: str, entry: dict) -> Optional[str]:
-    """Default `tool` detector used by EnvDetector when no probe is injected.
-    Currently resolves OLLAMA_MODELS from the ollama service when the shell doesn't set it."""
+    """Default `tool` detector used by EnvDetector when no custom probe is injected. Called for
+    every var whose detect list includes 'tool' (currently HF_HOME/HF_TOKEN/TORCH_HOME/OLLAMA_MODELS);
+    only OLLAMA_MODELS is handled — returns None for the rest, so their behavior is unchanged."""
     if var == "OLLAMA_MODELS":
         return _detect_ollama_models()
     return None
