@@ -4281,6 +4281,47 @@ def _sync_store_dir(src: Path, dst: Path, verify: bool = False) -> tuple[int, in
     return (copied, skipped)
 
 
+def _build_backup_manifest(config: dict, registry: "Registry", store_root: Path) -> dict:
+    store_files = []
+    if store_root.exists():
+        for f in sorted(store_root.rglob("*")):
+            if f.is_file() and not f.is_symlink():
+                store_files.append({"path": str(Path("store") / f.relative_to(store_root)),
+                                    "size": f.stat().st_size, "quick_hash": _quick_hash(f)})
+    return {
+        "aim_backup_version": 1,
+        "created_at": _now_iso(),
+        "source_root": str(Path(get_primary_root(config).path)),
+        "models": [m.to_dict() for m in registry.models],
+        "sources": config.get("sources", {}),
+        "env": config.get("env", {}),
+        "store_files": store_files,
+    }
+
+
+def op_backup(config: dict, registry: "Registry", dest: str, verify: bool = False,
+              json_output: bool = False) -> int:
+    root = get_primary_root(config)
+    store_root = root.store_path
+    dest_dir = Path(dest).expanduser()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    native = [m.id for m in registry.models if m.native_cas]
+    if native:
+        shown = ", ".join(native[:5]) + (" ..." if len(native) > 5 else "")
+        print(f"Warning: {len(native)} native model(s) not ingested (not in store, won't be backed up): {shown}")
+        print("  Run 'aim ingest --all-native' first to include them.")
+    copied, skipped = _sync_store_dir(store_root, dest_dir / "store", verify=verify)
+    manifest = _build_backup_manifest(config, registry, store_root)
+    (dest_dir / "aim-backup.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    out = {"status": "backed_up", "dest": str(dest_dir), "copied": copied, "skipped": skipped,
+           "models": len(manifest["models"]), "native_uningested": len(native)}
+    if json_output:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Backed up {len(manifest['models'])} model(s) to {dest_dir} (copied {copied}, skipped {skipped}).")
+    return EXIT_OK
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}
