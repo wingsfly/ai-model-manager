@@ -93,7 +93,7 @@ SP3 不引入新的存储概念,而是**消费 SP2 的 `storage` 标注**(class/
    - 单模型壳重建失败 → 收集错误、继续其余、末尾汇总(不中断)。
 6. **恢复源配置**:把 manifest.sources 的 `managed_env` 并入 `config["sources"]`(目标机获得同样的 HF_ENDPOINT/加速等)。
 7. **env**:`EnvDetector` 检测目标机并**打印**建议值(含恢复的 managed_env);`--apply-env` 才调 `op_env_apply` 写入,否则提示"运行 `aim env apply` 应用"。
-8. **verify**:对重建的壳做一遍校验(复用 SP2 verify 的 shim 检查),汇总 ok/失败。
+8. **校验/汇总**:壳重建本身即逐模型校验——每个 `_rebuild_shim_from_storage` 在 try/except 中执行,失败收集进 `errors` 并在末尾汇总(单壳失败不中断、返回 `EXIT_FAILED`)。还原后用户可另跑 `aim verify [--fix]`(SP2)对全部壳做独立解析校验/自愈。(实现说明:还原流程不内置额外的 post-rebuild 解析遍历,以重建错误收集 + 独立 `aim verify` 覆盖。)
 
 ### 安全
 - 幂等可重跑;store 跳过同大小、**不删除**目标多余文件(只新增/覆盖壳)。
