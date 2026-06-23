@@ -4367,6 +4367,55 @@ def op_ingest(config: dict, registry: "Registry", model_id: str, new_id: str = "
         print(f"Ingested {model_id} -> {store_rel}")
         return True
 
+    if tool in ("pytorch-hub", "whisper-cache"):
+        info = _flatfile_read_native(cache_repo)
+        fname = info["files"][0]["name"]
+        target_id = _sanitize_ingest_id(entry, new_id)
+        target_cat = category or entry.category or "uncategorized"
+        store_dir = (root.store_path / target_cat / target_id)
+        store_rel = str(store_dir.relative_to(Path(root.path)))
+        if dry_run:
+            print(f"[dry-run] would ingest {model_id} -> {store_rel}/{fname}, symlink original back")
+            return True
+        if store_dir.exists():
+            print(f"Error: store dir already exists: {store_dir}", file=sys.stderr)
+            return False
+        try:
+            size = _ingest_to_store(info["files"], store_dir)
+            _flatfile_build_shim(cache_repo, store_dir / fname)
+        except OSError as ex:
+            if store_dir.exists():
+                shutil.rmtree(store_dir, ignore_errors=True)
+            print(f"Error: ingest failed, rolled back: {ex}", file=sys.stderr)
+            return False
+        cache_base = Path(config.get("sources", {}).get(tool, {}).get("cache_path", ""))
+        try:
+            rel = str(cache_repo.relative_to(cache_base)) if str(cache_base) else fname
+        except ValueError:
+            rel = fname
+        cls = "managed-torch" if tool == "pytorch-hub" else "managed-whisper"
+        cache_root_var = "TORCH_HOME" if tool == "pytorch-hub" else "XDG_CACHE_HOME"
+        entry.native_cas = False
+        entry.id = target_id
+        entry.category = target_cat
+        entry.size_bytes = size
+        entry.format = fname.rsplit(".", 1)[-1] if "." in fname else entry.format
+        entry.canonical = {"root": root.id, "path": store_rel}
+        entry.storage = {
+            "class": cls, "store_path": store_rel, "ingested_at": _now_iso(),
+            "shims": [{
+                "tool": tool, "kind": "flat-file",
+                "location": str(cache_repo.relative_to(Path(root.path))) if str(cache_repo).startswith(str(root.path)) else str(cache_repo),
+                "cache_root_var": cache_root_var,
+                "reconstruct": {"filename": fname, "rel": rel},
+            }],
+        }
+        registry.add(entry)
+        if registry_save:
+            registry.save()
+        print(f"Ingested {model_id} -> {store_rel}")
+        return True
+
     print(f"Error: ingest not yet implemented for source type '{tool}'.", file=sys.stderr)
     return False
 
