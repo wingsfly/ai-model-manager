@@ -4254,6 +4254,33 @@ def op_ingest_all(config: dict, registry: "Registry", dry_run: bool = False,
     return done
 
 
+# ── Backup / Restore (SP3) ───────────────────────────────────────────────────
+
+
+def _sync_store_dir(src: Path, dst: Path, verify: bool = False) -> tuple[int, int]:
+    """Idempotently copy every real file under src/ into dst/, preserving layout.
+    Skip when dst already has the file at the same size (or same quick_hash when verify).
+    Returns (copied, skipped)."""
+    copied = skipped = 0
+    if not src.exists():
+        return (0, 0)
+    for f in sorted(src.rglob("*")):
+        if not f.is_file() or f.is_symlink():
+            continue
+        target = dst / f.relative_to(src)
+        if target.exists():
+            same = target.stat().st_size == f.stat().st_size
+            if same and verify:
+                same = _quick_hash(target) == _quick_hash(f)
+            if same:
+                skipped += 1
+                continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+        copied += 1
+    return (copied, skipped)
+
+
 # ── Path Resolution ────────────────────────────────────────────────────────
 
 WEIGHT_EXTS = {".safetensors", ".pt", ".pth", ".gguf", ".bin", ".onnx"}
