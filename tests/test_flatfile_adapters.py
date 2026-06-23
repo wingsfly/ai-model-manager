@@ -36,5 +36,34 @@ class PyTorchHubAdapterTests(unittest.TestCase):
         self.assertEqual(wav.category, "asr/model")
 
 
+class WhisperCacheAdapterTests(unittest.TestCase):
+    def setUp(self):
+        self.wc = Path(tempfile.mkdtemp())
+        self.config = aim.default_config()
+        self.config["sources"]["whisper-cache"] = {"cache_path": str(self.wc)}
+        self.root = aim.StorageRoot(id="primary", path=str(self.wc / "AI"))
+
+    def test_registered_and_source(self):
+        self.assertIn("whisper-cache", aim.ADAPTERS)
+        self.assertIn("whisper-cache", aim.ENGINE_NAMES)
+        self.assertIn("whisper-cache", aim.SOURCES)
+
+    def test_cache_dir_resolves_to_xdg_whisper(self):
+        det = aim.EnvDetector(home=Path("/h"), rc_files=[],
+                              shell_value=lambda v: "/x/cache" if v == "XDG_CACHE_HOME" else None)
+        self.assertEqual(det.cache_dir("whisper-cache"), Path("/x/cache/whisper"))
+        det2 = aim.EnvDetector(home=Path("/h"), rc_files=[], shell_value=lambda v: None)
+        self.assertEqual(det2.cache_dir("whisper-cache"), Path("/h/.cache/whisper"))
+
+    def test_scan_finds_pt_files(self):
+        _write(self.wc / "base.pt", b"B" * 12)
+        _write(self.wc / "large-v3.pt", b"L" * 15)
+        ad = aim.WhisperCacheAdapter(self.config, self.root)
+        scanned = ad.scan()
+        self.assertEqual(sorted(s.name for s in scanned), ["whisper-base", "whisper-large-v3"])
+        self.assertTrue(all(s.native_cas and s.category == "asr/model" for s in scanned))
+        self.assertEqual(scanned[0].source["type"], "whisper-cache")
+
+
 if __name__ == "__main__":
     unittest.main()

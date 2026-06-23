@@ -87,5 +87,29 @@ class FlatFileIngestTests(unittest.TestCase):
         self.assertEqual(reg.find("torch-wav2vec2").storage, {})
 
 
+class WhisperIngestTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.config = aim.default_config()
+        self.config["roots"] = [{"id": "primary", "path": str(self.home / "AI")}]
+        self.wc = Path(self.config["roots"][0]["path"]) / "wcache" / "whisper"
+        self.config["sources"]["whisper-cache"] = {"cache_path": str(self.wc)}
+
+    def test_ingest_whisper_pt(self):
+        pt = _write(self.wc / "base.pt", b"W" * 40)
+        reg = aim.Registry()
+        reg.models = [aim.ModelEntry(id="whisper-base", native_cas=True,
+                      source={"type": "whisper-cache", "repo_id": "base"}, category="asr/model",
+                      canonical={"root": "primary", "path": str(pt)})]
+        ok = aim.op_ingest(self.config, reg, "whisper-base", registry_save=False)
+        self.assertTrue(ok)
+        e = reg.find("whisper-base")
+        self.assertEqual(e.storage["class"], "managed-whisper")
+        store = Path(self.config["roots"][0]["path"]) / e.storage["store_path"]
+        self.assertEqual((store / "base.pt").read_bytes(), b"W" * 40)
+        self.assertTrue(pt.is_symlink())
+        self.assertEqual(e.storage["shims"][0]["reconstruct"], {"filename": "base.pt", "rel": "base.pt"})
+
+
 if __name__ == "__main__":
     unittest.main()

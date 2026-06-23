@@ -51,7 +51,7 @@ CATEGORIES = [
 ENGINE_NAMES = [
     "ollama", "huggingface", "omlx", "comfyui", "whisper",
     "coqui", "sparktts", "piper", "fish-speech", "modelscope",
-    "pytorch-hub",
+    "pytorch-hub", "whisper-cache",
 ]
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
@@ -214,6 +214,7 @@ def default_config() -> dict:
             "fish-speech": {"enabled": True, "model_dir": "services/fish-speech"},
             "modelscope":  {"enabled": True, "model_dir": "modelscope", "native_cas": True},
             "pytorch-hub": {"enabled": True, "model_dir": "torch/hub", "native_cas": True},
+            "whisper-cache": {"enabled": True, "model_dir": ".cache/whisper", "native_cas": True},
         },
         "sources": {},
         "env": {"managed": False, "shells": [], "files": {}},
@@ -1135,6 +1136,36 @@ class PyTorchHubAdapter(EngineAdapter):
         return False
 
 
+
+class WhisperCacheAdapter(EngineAdapter):
+    name = "whisper-cache"
+
+    def supported_formats(self) -> list[str]:
+        return ["pt"]
+
+    def scan(self) -> list[ScannedModel]:
+        results: list[ScannedModel] = []
+        base = self.base_path
+        if not base.is_dir():
+            return results
+        for f in sorted(base.iterdir()):
+            if not f.is_file() or f.is_symlink() or f.suffix != ".pt":
+                continue
+            results.append(ScannedModel(
+                id=self._make_id(f"whisper-{f.stem}"), name=f"whisper-{f.stem}", path=str(f),
+                engine=self.name, format="pt", size_bytes=f.stat().st_size,
+                category="asr/model", tags=["whisper", "openai-whisper"],
+                source={"type": "whisper-cache", "repo_id": f.stem},
+                native_cas=True, is_directory=False))
+        return results
+
+    def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
+        return []
+
+    def unprovision(self, model: ModelEntry) -> bool:
+        return False
+
+
 # Adapter registry
 ADAPTERS: dict[str, type[EngineAdapter]] = {
     "ollama": OllamaAdapter,
@@ -1148,6 +1179,7 @@ ADAPTERS: dict[str, type[EngineAdapter]] = {
     "fish-speech": FishSpeechAdapter,
     "modelscope": ModelScopeAdapter,
     "pytorch-hub": PyTorchHubAdapter,
+    "whisper-cache": WhisperCacheAdapter,
 }
 
 
@@ -1421,6 +1453,15 @@ SOURCES: dict[str, dict] = {
             {"name": "TORCH_HOME", "role": "cache_dir", "default": "~/.cache/torch",
              "subpath": "hub", "detect": ["env", "rc", "tool"], "manage": "env_file", "secret": False},
         ],
+    },
+    "whisper-cache": {
+        "aliases": ["whisper-dl"],
+        "cache_layout": "flat-file",
+        "tools": [{"name": "whisper", "check": "which",
+                   "install_cmd": "pip3 install --break-system-packages -U openai-whisper",
+                   "description": "openai-whisper"}],
+        "env": [{"name": "XDG_CACHE_HOME", "role": "cache_dir", "default": "~/.cache",
+                 "subpath": "whisper", "detect": ["env", "rc"], "manage": "none", "secret": False}],
     },
     "civitai": {
         "aliases": [],
