@@ -4049,7 +4049,8 @@ def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
     storage = entry.storage or {}
     if not storage.get("shims"):
         return False
-    root = get_primary_root(config)
+    roots = {r.id: r for r in get_roots(config)}
+    root = roots.get(entry.canonical.get("root", "")) or get_primary_root(config)
     store_dir = Path(root.path) / storage.get("store_path", "")
     rebuilt = False
     for shim in storage["shims"]:
@@ -4354,6 +4355,58 @@ def _retarget_shim_locations(entry: "ModelEntry", detector: "EnvDetector") -> No
             org, _, _ = rc.get("repo_id", "").partition("/")
             if ms and org and rc.get("dir_name"):
                 shim["location"] = str(ms / "models" / org / rc["dir_name"])
+
+
+def op_restore(config: dict, registry: "Registry", src: str, root_id: str = "",
+               apply_env: bool = False, verify: bool = False,
+               detector: Optional["EnvDetector"] = None, json_output: bool = False) -> int:
+    backup_dir = Path(src).expanduser()
+    try:
+        man = _read_backup_manifest(backup_dir)
+    except (FileNotFoundError, ValueError) as ex:
+        print(f"Error: {ex}", file=sys.stderr)
+        return EXIT_FAILED
+    roots = {r.id: r for r in get_roots(config)}
+    root = roots.get(root_id) if root_id else get_primary_root(config)
+    if not root:
+        print(f"Error: unknown root '{root_id}'", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    copied, skipped = _sync_store_dir(backup_dir / "store", root.store_path, verify=verify)
+    det = detector or EnvDetector()
+    rebuilt = 0
+    errors: list = []
+    for md in man.get("models", []):
+        entry = ModelEntry.from_dict(md)
+        entry.canonical = dict(entry.canonical or {})
+        entry.canonical["root"] = root.id
+        if entry.storage.get("shims"):
+            _retarget_shim_locations(entry, det)
+            try:
+                if _rebuild_shim_from_storage(config, entry):
+                    rebuilt += 1
+            except Exception as ex:
+                errors.append((entry.id, str(ex)))
+        registry.add(entry)
+    registry.save()
+    csources = config.setdefault("sources", {})
+    for k, v in man.get("sources", {}).items():
+        if isinstance(v, dict) and v.get("managed_env"):
+            csources.setdefault(k, {}).setdefault("managed_env", {}).update(v["managed_env"])
+    if apply_env:
+        op_env_apply(config, registry)
+        print("Applied env to shell config.")
+    else:
+        print("Recommended: run 'aim env apply' to set tool env vars on this machine.")
+    for mid, err in errors:
+        print(f"  shim rebuild failed for {mid}: {err}", file=sys.stderr)
+    out = {"status": "restored", "root": root.id, "models": len(man.get("models", [])),
+           "store_copied": copied, "store_skipped": skipped, "shims_rebuilt": rebuilt, "errors": len(errors)}
+    if json_output:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Restored {out['models']} model(s) to root '{root.id}' "
+              f"(store copied {copied}, skipped {skipped}; shims rebuilt {rebuilt}, errors {len(errors)}).")
+    return EXIT_OK if not errors else EXIT_FAILED
 
 
 # ── Path Resolution ────────────────────────────────────────────────────────
