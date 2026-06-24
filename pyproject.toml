@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-model-manager"
+dynamic = ["version"]
+description = "aim — a single-file, zero-dependency CLI to manage local AI models across HuggingFace, Ollama, ModelScope, PyTorch Hub & openai-whisper: store-as-source-of-truth, in-place load shims, portable backup/restore."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "wingsfly", email = "nemosapple@gmail.com" }]
+keywords = [
+    "ai", "models", "model-management", "huggingface", "ollama",
+    "modelscope", "pytorch-hub", "whisper", "llm", "cli",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Archiving :: Mirroring",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/wingsfly/ai-model-manager"
+Repository = "https://github.com/wingsfly/ai-model-manager"
+Issues = "https://github.com/wingsfly/ai-model-manager/issues"
+
+[project.scripts]
+aim = "aim:main"
+
+[tool.setuptools]
+py-modules = ["aim"]
+
+[tool.setuptools.dynamic]
+version = { attr = "aim.VERSION" }
