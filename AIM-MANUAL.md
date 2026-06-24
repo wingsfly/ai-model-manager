@@ -156,8 +156,16 @@ aim download ms:Qwen/Qwen2-7B --category llm/chat
 | `source` | 来源，格式见上方示例 |
 | `--name ID` | 自定义模型 ID（默认从 source 推断） |
 | `--category CAT` | 模型分类（如 `llm/chat`, `tts/model`） |
+| `-y` / `--yes` | 缺后端工具时自动安装，不弹交互确认 |
 
 下载的 HuggingFace 模型默认使用 `~/AI/hfd.sh`（hfd 工具），不可用时回退到 `huggingface-cli`。
+
+**无人值守 / headless 自动装后端：** 缺后端工具（如 ModelScope CLI）时，aim 默认会交互式 `[y/N]` 确认安装。被其它服务以子进程方式（无 TTY/stdin）调用时，可通过以下**任一**方式开启非交互自动安装：
+- `aim download ms:org/repo -y`（命令行参数）
+- `AIM_ASSUME_YES=1 aim download ms:...`（环境变量，在服务环境里设一次即可，所有 aim 子进程继承）
+- 在 `~/.aim/config.json` 写 `"defaults": {"auto_install_backend": true}`（持久化）
+
+未开启时若处于无 TTY 环境，aim **不再静默 Aborted**，而是向 stderr 打印明确错误（缺哪个后端、安装命令、如何开启自动安装）并失败；`--json` 模式返回结构化 `BACKEND_NOT_FOUND`。
 
 ---
 
