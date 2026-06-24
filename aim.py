@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 AIM_HOME = Path.home() / ".aim"
 CONFIG_FILE = "config.json"
 REGISTRY_FILE = "registry.json"
@@ -191,6 +191,7 @@ def default_config() -> dict:
         "defaults": {
             "link_type": "auto",
             "hf_download_tool": "hfd",
+            "auto_install_backend": False,
         },
         "download": {
             "proxy": "",
@@ -1518,6 +1519,16 @@ def _check_backend_available(tool_entry: dict, config: dict) -> bool:
     return False
 
 
+def _assume_yes(config: dict, auto_confirm: bool) -> bool:
+    """Backend auto-install opted-in via -y/--yes, AIM_ASSUME_YES env, or config
+    defaults.auto_install_backend. Lets headless callers enable non-interactive install."""
+    if auto_confirm:
+        return True
+    if os.environ.get("AIM_ASSUME_YES", "").strip().lower() in ("1", "true", "yes", "y", "on"):
+        return True
+    return bool(config.get("defaults", {}).get("auto_install_backend", False))
+
+
 def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_confirm: bool) -> tuple[bool, str]:
     tools = _BACKEND_REGISTRY.get(source_type)
     if not tools:
@@ -1525,6 +1536,7 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
     for t in tools:
         if _check_backend_available(t, config):
             return True, ""
+    auto_confirm = _assume_yes(config, auto_confirm)  # fold in env + config opt-ins
     root_path = config.get("roots", [{}])[0].get("path", "")
     missing = []
     for t in tools:
@@ -1538,7 +1550,7 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
                 "retryable": False,
                 "install_hint": {
                     "tools": missing,
-                    "note": "Install any one of the above tools, then retry. Use -y to auto-install.",
+                    "note": "Install any one of the above tools, then retry. To auto-install: pass -y, set AIM_ASSUME_YES=1, or set defaults.auto_install_backend=true.",
                 },
             }
         }, ensure_ascii=False)
@@ -1550,6 +1562,15 @@ def _ensure_backend(source_type: str, config: dict, json_output: bool, auto_conf
             print(f"  {i + 1}. {m['description']}: {m['install_cmd']}")
         print()
     if not auto_confirm and not json_output:
+        if not sys.stdin.isatty():
+            print(f"Error: no backend tool for '{source_type}' downloads, and stdin is not a TTY "
+                  f"(cannot prompt to install).", file=sys.stderr)
+            print("  Install one of:", file=sys.stderr)
+            for m in missing:
+                print(f"    {m['description']}: {m['install_cmd']}", file=sys.stderr)
+            print("  Or enable auto-install: pass -y, set AIM_ASSUME_YES=1, or set "
+                  "defaults.auto_install_backend=true in ~/.aim/config.json", file=sys.stderr)
+            return False, ""
         try:
             answer = input(f"Install {missing[0]['description']}? [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -4900,7 +4921,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", dest="resume", action="store_true", default=True, help="Resume partial download when supported (default)")
     p.add_argument("--no-resume", dest="resume", action="store_false", help="Disable resume behavior")
     p.add_argument("--force-redownload", action="store_true", dest="force_redownload", help="Redownload even if model already exists")
-    p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Auto-confirm installation of missing backend tools")
+    p.add_argument("-y", "--yes", action="store_true", dest="auto_confirm", help="Auto-confirm installation of missing backend tools (also: AIM_ASSUME_YES=1 env, or defaults.auto_install_backend in config)")
 
     # provision
     p = sub.add_parser("provision", help="Create engine links for a model")

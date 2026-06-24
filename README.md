@@ -56,6 +56,15 @@ aim organize <model_id>
 aim download hf:org/repo
 aim download ollama:model:tag
 aim download hf:org/repo --json
+
+# Non-interactive / headless backend auto-install (e.g. called by another service):
+#   a missing backend (ModelScope CLI, etc.) is normally confirmed interactively [y/N].
+#   To auto-install without a prompt, opt in via ANY of:
+#     aim download ms:org/repo -y           # flag
+#     AIM_ASSUME_YES=1 aim download ms:...   # env var (set once in the service env)
+#     # or set  "defaults": {"auto_install_backend": true}  in ~/.aim/config.json
+#   Headless with NO opt-in: aim prints a clear stderr error (missing tool + how to enable)
+#   and fails — it never silently hangs or aborts. With --json it returns BACKEND_NOT_FOUND.
 aim download status <job_id> --json
 aim download cancel <job_id>
 aim download hf:org/repo --category llm/chat
