@@ -29,6 +29,10 @@ chmod +x aim.py
 # Scan all engines and register models
 aim scan
 
+# Re-classify model categories from each model's shipped metadata (no delete+rescan)
+aim recategorize --all --dry-run     # preview every change
+aim recategorize --all               # apply
+
 # List registered models
 aim list
 aim list --engine comfyui --sort size
@@ -173,17 +177,61 @@ Sharded models (`model-00001-of-00006`) → `null` (load from directory).
 
 ```
 ~/AI/store/
-├── asr/model/           — Whisper models
+├── asr/model/           — speech-to-text models (Whisper, Paraformer, SenseVoice …)
+├── audio/
+│   ├── vad/             — voice-activity detection (silero, fsmn-vad)
+│   ├── codec/           — neural audio codecs (EnCodec, SNAC)
+│   ├── punctuation/     — punctuation restoration
+│   ├── speaker/         — speaker verification / diarization
+│   └── emotion/         — speech-emotion recognition
 ├── image-gen/
 │   ├── checkpoint/      — FLUX, SDXL checkpoints
 │   ├── lora/            — LoRA weights
 │   ├── text-encoder/    — CLIP, T5 encoders
 │   └── vae/             — VAE models
-├── llm/chat/            — LLM chat models (MLX)
+├── llm/
+│   ├── chat/            — LLM chat models
+│   ├── embedding/       — embedding / sentence-transformer models
+│   └── vision/          — multimodal / vision-language / "omni" models
 └── tts/
     ├── model/           — TTS models
-    └── vocoder/         — Vocoder models
+    └── vocoder/         — vocoder models
 ```
+
+## Model Classification
+
+Every registered model gets a `category` (which store subtree it lives in). `aim` infers it from
+the **metadata the model ships with**, not by guessing from its name — trying the most authoritative
+signal first and recording which one decided it in `category_source`:
+
+| # | Signal (read from the model directory) | Example |
+|---|----------------------------------------|---------|
+| 1 | HF `README.md` frontmatter `pipeline_tag` / `tags` / `library_name` | `automatic-speech-recognition` → `asr/model` |
+| 2 | ModelScope `configuration.json` `task` | `voice-activity-detection` → `audio/vad` |
+| 3 | HF `config.json` `architectures` / `model_type` | `WhisperForConditionalGeneration` → `asr/model`; a `vision_config`/`audio_config` → `llm/vision` |
+| 4 | File-structure signatures | diffusers `model_index.json` → `image-gen/checkpoint`; `adapter_config.json` → `image-gen/lora` |
+| 5 | Repo-id keywords (best-effort) | `…/whisper-large-v3` → `asr/model` |
+| 6 | Default | `llm/chat` (recorded as a low-confidence guess) |
+
+Authority order of `category_source`: `manual` > `pipeline_tag` = `ms_task` > `config_arch` >
+`file_sig` > `repo_keyword` > `default`.
+
+- **`aim scan`** classifies newly-discovered models and *self-heals* a previously guessed category
+  (`default`/`repo_keyword`) when a re-scan reads a stronger signal — never overwriting an
+  authoritative or manual one.
+- **`aim recategorize`** re-classifies already-registered models in place (no delete + rescan):
+
+  ```bash
+  aim recategorize --all --dry-run   # preview every change
+  aim recategorize <model-id>        # a single model
+  aim recategorize --all             # apply (upgrades only; weaker signals are skipped)
+  aim recategorize --all --force     # override even stronger / manual categories
+  ```
+
+> Multimodal models (vision-language, audio-LLM, "omni") are classified by their true nature —
+> `llm/vision` — even when an application happens to use them for a single modality (e.g. ASR).
+> `aim resolve` is category-agnostic, so consumers keep resolving the same path across a
+> recategorization.
 
 ## How It Works
 

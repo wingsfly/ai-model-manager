@@ -45,8 +45,244 @@ CATEGORIES = [
     "image-gen/upscaler",
     "tts/model", "tts/vocoder", "tts/voice",
     "asr/model",
-    "audio/codec", "audio/vad",
+    "audio/codec", "audio/vad", "audio/punctuation", "audio/speaker", "audio/emotion",
 ]
+
+
+# ── Model classification ───────────────────────────────────────────────────────
+# Classify a model into a CATEGORIES bucket. Prefer the authoritative metadata a model ships with
+# (HF README ``pipeline_tag``, ModelScope ``configuration.json`` task, ``config.json``
+# architectures) over guessing from the repo id — the old keyword-only guess mis-filed e.g. the
+# FunASR VAD as llm/chat and multimodal LLMs as plain chat. Each signal records its provenance
+# (``category_source``) so low-confidence guesses stay visible + can be re-judged (`aim recategorize`).
+
+# HF README frontmatter ``pipeline_tag`` (and explicit task tags) → category.
+_PIPELINE_TAG_CATEGORY = {
+    "automatic-speech-recognition": "asr/model",
+    "voice-activity-detection": "audio/vad",
+    "text-to-speech": "tts/model",
+    "text-to-audio": "tts/model",
+    "audio-to-audio": "tts/model",
+    "feature-extraction": "llm/embedding",
+    "sentence-similarity": "llm/embedding",
+    "text-generation": "llm/chat",
+    "text2text-generation": "llm/chat",
+    "fill-mask": "llm/chat",
+    "image-text-to-text": "llm/vision",
+    "visual-question-answering": "llm/vision",
+    "any-to-any": "llm/vision",
+    "text-to-image": "image-gen/checkpoint",
+    "image-to-image": "image-gen/checkpoint",
+}
+
+# ModelScope ``configuration.json`` ``task`` → category (FunASR/iic + general ModelScope tasks).
+_MS_TASK_CATEGORY = {
+    "auto-speech-recognition": "asr/model",
+    "automatic-speech-recognition": "asr/model",
+    "voice-activity-detection": "audio/vad",
+    "punctuation": "audio/punctuation",
+    "punctuation-restoration": "audio/punctuation",
+    "speaker-verification": "audio/speaker",
+    "speaker-diarization": "audio/speaker",
+    "speech-emotion-recognition": "audio/emotion",
+    "emotion-recognition": "audio/emotion",
+    "text-to-speech": "tts/model",
+    "text-generation": "llm/chat",
+    "chat": "llm/chat",
+    "sentence-embedding": "llm/embedding",
+    "text-to-image-synthesis": "image-gen/checkpoint",
+}
+
+# HF ``config.json`` ``model_type`` → category. Multimodal/omni models map to llm/vision.
+_MODEL_TYPE_CATEGORY = {
+    "whisper": "asr/model", "wav2vec2": "asr/model", "wav2vec2-conformer": "asr/model",
+    "wavlm": "asr/model", "hubert": "asr/model", "unispeech": "asr/model",
+    "unispeech-sat": "asr/model", "sew": "asr/model", "sew-d": "asr/model",
+    "moonshine": "asr/model", "speech_to_text": "asr/model", "speech-encoder-decoder": "asr/model",
+    "seamless_m4t": "asr/model", "seamless_m4t_v2": "asr/model", "data2vec-audio": "asr/model",
+    "mctct": "asr/model",
+    "vits": "tts/model", "bark": "tts/model", "fastspeech2_conformer": "tts/model",
+    "parler_tts": "tts/model", "musicgen": "tts/model",
+    "qwen2_vl": "llm/vision", "qwen2_5_vl": "llm/vision", "qwen3_vl": "llm/vision",
+    "qwen2_audio": "llm/vision", "qwen3_omni": "llm/vision", "qwen3_omni_moe": "llm/vision",
+    "llava": "llm/vision", "llava_next": "llm/vision", "mllama": "llm/vision",
+    "idefics2": "llm/vision", "idefics3": "llm/vision", "gemma3": "llm/vision",
+    "gemma3n": "llm/vision", "phi4_multimodal": "llm/vision", "paligemma": "llm/vision",
+    "pixtral": "llm/vision", "internvl_chat": "llm/vision", "minicpmv": "llm/vision",
+    "smolvlm": "llm/vision",
+}
+
+# Confidence of the signal that decided a category (higher = more authoritative). Used to avoid
+# clobbering a stronger/manual categorisation with a weaker re-scan, and to flag guesses.
+_CATEGORY_SOURCE_RANK = {
+    "manual": 100, "pipeline_tag": 90, "ms_task": 90, "config_arch": 70,
+    "file_sig": 50, "repo_keyword": 30, "default": 0, "": 0,
+}
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _metadata_dir(model_dir: Path) -> Path:
+    """HF caches keep config.json/README.md under ``snapshots/<commit>/``; descend into the newest
+    snapshot. ModelScope/flat layouts hold them directly. Returns the dir to read metadata from."""
+    snaps = model_dir / "snapshots"
+    if snaps.is_dir():
+        subs = [s for s in snaps.iterdir() if s.is_dir()]
+        if subs:
+            try:
+                return max(subs, key=lambda p: p.stat().st_mtime)
+            except OSError:
+                return subs[0]
+    return model_dir
+
+
+def _readme_frontmatter(meta_dir: Path) -> dict:
+    """Parse the leading ``---``-fenced YAML frontmatter of README.md (no yaml dep): captures the
+    ``pipeline_tag``/``library_name`` scalars and a ``tags`` list (inline or block form)."""
+    readme = meta_dir / "README.md"
+    if not readme.is_file():
+        return {}
+    try:
+        text = readme.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+    m = re.match(r"^﻿?---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
+    if not m:
+        return {}
+    block, fm = m.group(1), {}
+    for key in ("pipeline_tag", "library_name"):
+        sc = re.search(rf"(?m)^{key}:\s*([^\n#]+)", block)
+        if sc:
+            fm[key] = sc.group(1).strip().strip("'\"").lower()
+    inline = re.search(r"(?m)^tags:\s*\[([^\]]*)\]", block)
+    if inline:
+        fm["tags"] = [t.strip().strip("'\"").lower() for t in inline.group(1).split(",") if t.strip()]
+    else:
+        bl = re.search(r"(?m)^tags:\s*\n((?:[ \t]*-[ \t]*[^\n]+\n?)+)", block)
+        if bl:
+            fm["tags"] = [re.sub(r"^[ \t]*-[ \t]*", "", ln).strip().strip("'\"").lower()
+                          for ln in bl.group(1).splitlines() if ln.strip()]
+    return fm
+
+
+def _category_from_pipeline_tag(meta_dir: Path) -> Optional[str]:
+    fm = _readme_frontmatter(meta_dir)
+    pt = fm.get("pipeline_tag")
+    if pt and pt in _PIPELINE_TAG_CATEGORY:
+        return _PIPELINE_TAG_CATEGORY[pt]
+    for t in fm.get("tags", []):
+        if t in _PIPELINE_TAG_CATEGORY:
+            return _PIPELINE_TAG_CATEGORY[t]
+    lib = fm.get("library_name", "")
+    if lib == "diffusers":
+        return "image-gen/checkpoint"
+    if lib == "sentence-transformers":
+        return "llm/embedding"
+    return None
+
+
+def _category_from_ms_task(meta_dir: Path) -> Optional[str]:
+    cfg = _read_json(meta_dir / "configuration.json")
+    return _MS_TASK_CATEGORY.get(str(cfg.get("task", "")).strip().lower())
+
+
+def _category_from_config_arch(meta_dir: Path) -> Optional[str]:
+    cfg = _read_json(meta_dir / "config.json")
+    if not cfg:
+        return None
+    mt = str(cfg.get("model_type", "")).strip().lower()
+    if mt in _MODEL_TYPE_CATEGORY:
+        return _MODEL_TYPE_CATEGORY[mt]
+    archs = [a for a in (cfg.get("architectures") or []) if isinstance(a, str)]
+    al = " ".join(archs).lower()
+    if "fortexttospeech" in al:
+        return "tts/model"
+    if "forctc" in al:
+        return "asr/model"
+    # a vision/audio sub-config is a strong multimodal signal (e.g. gemma-3/4, qwen-omni)
+    if cfg.get("vision_config") or cfg.get("audio_config"):
+        return "llm/vision"
+    if any(a.endswith("ForCausalLM") for a in archs):
+        return "llm/chat"
+    return None
+
+
+def _category_from_file_signatures(model_dir: Path, meta_dir: Path) -> Optional[str]:
+    if (meta_dir / "model_index.json").is_file() or \
+            ((meta_dir / "unet").is_dir() and (meta_dir / "vae").is_dir()):
+        return "image-gen/checkpoint"
+    if (meta_dir / "adapter_config.json").is_file():
+        return "image-gen/lora"
+    if (meta_dir / "modules.json").is_file():
+        return "llm/embedding"
+    if (model_dir / "am").is_dir() and ((model_dir / "graph").is_dir() or (model_dir / "conf").is_dir()):
+        return "asr/model"  # vosk/Kaldi layout
+    return None
+
+
+def _keyword_category(repo_id: str) -> Optional[str]:
+    """Best-effort category from the repo id alone (substring keywords); ``None`` when nothing
+    matches. Last-resort tier of ``classify_model`` — the metadata signals above it are preferred.
+    Specific audio components (vad/codec) match before the broader asr/tts buckets so they win."""
+    rl = repo_id.lower()
+    if any(k in rl for k in ["vad", "silero-vad"]):
+        return "audio/vad"
+    if any(k in rl for k in ["codec", "encodec", "snac"]):
+        return "audio/codec"
+    if any(k in rl for k in ["whisper", "w2v", "wav2vec", "asr", "paraformer", "sensevoice",
+                             "firered", "funasr", "wenet", "conformer", "uniasr", "moonshine",
+                             "parakeet", "canary", "voxtral", "vosk", "dolphin"]):
+        return "asr/model"
+    if any(k in rl for k in ["tts", "kokoro", "f5-tts", "marvis", "piper", "sparktts", "vocoder"]):
+        return "tts/model"
+    if any(k in rl for k in ["embed"]):
+        return "llm/embedding"
+    if any(k in rl for k in ["flux", "stable-diffusion", "sdxl"]):
+        return "image-gen/checkpoint"
+    if any(k in rl for k in ["lora"]):
+        return "image-gen/lora"
+    if any(k in rl for k in ["vae"]):
+        return "image-gen/vae"
+    return None
+
+
+def classify_model(repo_id: str, model_dir=None, source_type: str = "") -> tuple[str, str]:
+    """Classify a model into a CATEGORIES bucket using a confidence cascade. Returns
+    ``(category, source)`` where ``source`` is the deciding signal (see ``_CATEGORY_SOURCE_RANK``).
+    Authoritative metadata the model ships with wins over guessing from the repo id; with no model
+    directory available it degrades to the repo-id keyword heuristic, then the llm/chat default."""
+    if model_dir is not None:
+        d = Path(model_dir)
+        if d.is_dir():
+            meta = _metadata_dir(d)
+            for reader, src in (
+                (_category_from_pipeline_tag, "pipeline_tag"),
+                (_category_from_ms_task, "ms_task"),
+                (_category_from_config_arch, "config_arch"),
+            ):
+                cat = reader(meta)
+                if cat:
+                    return cat, src
+            cat = _category_from_file_signatures(d, meta)
+            if cat:
+                return cat, "file_sig"
+    cat = _keyword_category(repo_id)
+    if cat:
+        return cat, "repo_keyword"
+    return "llm/chat", "default"
+
+
+def _infer_category_from_repo_id(repo_id: str) -> str:
+    """Back-compat repo-id-only classifier (keyword match; llm/chat default). Prefer
+    ``classify_model`` which also reads the model's shipped metadata."""
+    return _keyword_category(repo_id) or "llm/chat"
 
 ENGINE_NAMES = [
     "ollama", "huggingface", "omlx", "comfyui", "whisper",
@@ -96,6 +332,7 @@ class ModelEntry:
     format: str = ""
     size_bytes: int = 0
     category: str = ""
+    category_source: str = ""  # provenance: pipeline_tag/ms_task/config_arch/file_sig/repo_keyword/default/manual
     tags: list[str] = field(default_factory=list)
     canonical: dict = field(default_factory=dict)  # {"root": str, "path": str}
     native_cas: bool = False
@@ -147,6 +384,7 @@ class ScannedModel:
     format: str = ""
     size_bytes: int = 0
     category: str = ""
+    category_source: str = ""
     tags: list[str] = field(default_factory=list)
     source: dict = field(default_factory=dict)
     native_cas: bool = False
@@ -587,8 +825,9 @@ class HuggingFaceAdapter(EngineAdapter):
                         if model_format:
                             break
 
-            # infer category
-            category = self._infer_category(repo_id, repo)
+            # classify from the model's shipped metadata (config.json / README), repo id as fallback
+            category, category_source = classify_model(
+                repo_id, model_dir=repo_dir, source_type="huggingface")
 
             mid = self._make_id(f"hf-{org}-{repo}")
             results.append(ScannedModel(
@@ -599,6 +838,7 @@ class HuggingFaceAdapter(EngineAdapter):
                 format=model_format,
                 size_bytes=total_size,
                 category=category,
+                category_source=category_source,
                 tags=["huggingface", org],
                 source={"type": "huggingface", "repo_id": repo_id},
                 native_cas=True,
@@ -607,26 +847,7 @@ class HuggingFaceAdapter(EngineAdapter):
         return results
 
     def _infer_category(self, repo_id: str, repo: str) -> str:
-        rl = repo_id.lower()
-        if any(k in rl for k in ["whisper", "w2v", "wav2vec"]):
-            return "asr/model"
-        if any(k in rl for k in ["tts", "kokoro", "f5-tts", "marvis", "piper", "sparktts"]):
-            return "tts/model"
-        if any(k in rl for k in ["vad", "silero-vad"]):
-            return "audio/vad"
-        if any(k in rl for k in ["codec", "encodec", "snac"]):
-            return "audio/codec"
-        if any(k in rl for k in ["embed"]):
-            return "llm/embedding"
-        if any(k in rl for k in ["flux", "stable-diffusion", "sdxl"]):
-            return "image-gen/checkpoint"
-        if any(k in rl for k in ["lora"]):
-            return "image-gen/lora"
-        if any(k in rl for k in ["vae"]):
-            return "image-gen/vae"
-        if any(k in rl for k in ["qwen", "llama", "gemma", "deepseek", "mistral"]):
-            return "llm/chat"
-        return "llm/chat"
+        return _infer_category_from_repo_id(repo_id)
 
     def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
         return []  # HF uses native CAS
@@ -1087,23 +1308,20 @@ class ModelScopeAdapter(EngineAdapter):
                             fmt = "safetensors"; break
                         if f.suffix in (".bin", ".pt", ".gguf") and f.is_file():
                             fmt = fmt or f.suffix[1:]
+                    category, category_source = classify_model(
+                        repo_id, model_dir=repo_dir, source_type="modelscope")
                     results.append(ScannedModel(
                         id=self._make_id(f"ms-{org_dir.name}-{repo_name}"),
                         name=repo_id, path=str(repo_dir), engine=self.name, format=fmt,
                         size_bytes=self._dir_size(repo_dir),
-                        category=self._infer_ms_category(repo_id),
+                        category=category, category_source=category_source,
                         tags=["modelscope", org_dir.name],
                         source={"type": "modelscope", "repo_id": repo_id},
                         native_cas=True, is_directory=True))
         return results
 
     def _infer_ms_category(self, repo_id: str) -> str:
-        rl = repo_id.lower()
-        if any(k in rl for k in ["asr", "paraformer", "whisper", "sensevoice", "firered"]):
-            return "asr/model"
-        if any(k in rl for k in ["tts", "vocoder"]):
-            return "tts/model"
-        return "llm/chat"
+        return _infer_category_from_repo_id(repo_id)
 
     def provision(self, model: ModelEntry, store_path: Path, options: dict = None) -> list[Provision]:
         return []
@@ -1225,6 +1443,14 @@ def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[S
         for s in scanned:
             existing = registry.find(s.id)
             if existing:
+                # self-heal a weak/guessed categorisation when a fresh scan reads a stronger signal
+                # (leave authoritative or manual categories untouched; `aim recategorize` can force)
+                _weak = ("", "default", "repo_keyword")
+                if (s.category and existing.category_source in _weak
+                        and _CATEGORY_SOURCE_RANK.get(s.category_source, 0)
+                        > _CATEGORY_SOURCE_RANK.get(existing.category_source, 0)):
+                    existing.category = s.category
+                    existing.category_source = s.category_source
                 # update size if different
                 if s.size_bytes and s.size_bytes != existing.size_bytes:
                     existing.size_bytes = s.size_bytes
@@ -1247,6 +1473,7 @@ def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[S
                     format=s.format,
                     size_bytes=s.size_bytes,
                     category=s.category,
+                    category_source=s.category_source,
                     tags=s.tags,
                     canonical=canonical,
                     native_cas=s.native_cas,
@@ -1262,6 +1489,63 @@ def op_scan(config: dict, registry: Registry, engine_filter: str = "") -> list[S
 
     registry.save()
     return all_scanned
+
+
+def op_recategorize(config: dict, registry: Registry, model_id: str = "",
+                    all_models: bool = False, dry_run: bool = False, force: bool = False,
+                    json_output: bool = False) -> int:
+    """Re-classify registered models in place via the metadata cascade (``classify_model``).
+
+    Fixes existing entries without a delete+rescan. A model is updated when the freshly-read signal
+    is at least as authoritative as the one recorded (or with --force). Without --all a model_id is
+    required."""
+    root = get_primary_root(config)
+    targets = list(registry.models) if all_models else [registry.find(model_id)]
+    if not all_models and targets[0] is None:
+        print(f"Model '{model_id}' not found.", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+
+    changed: list[tuple] = []
+    skipped: list[tuple] = []
+    for m in targets:
+        if m is None:
+            continue
+        repo_id = m.source.get("repo_id") or m.name or m.id
+        cpath = m.canonical.get("path", "")
+        model_dir = (Path(root.path) / cpath) if cpath else None
+        new_cat, new_src = classify_model(repo_id, model_dir=model_dir,
+                                          source_type=m.source.get("type", ""))
+        if new_cat == m.category and new_src == m.category_source:
+            continue
+        stronger = (_CATEGORY_SOURCE_RANK.get(new_src, 0)
+                    >= _CATEGORY_SOURCE_RANK.get(m.category_source, 0))
+        if not (force or stronger):
+            skipped.append((m.id, m.category, new_cat, new_src))
+            continue
+        changed.append((m.id, m.category, new_cat, new_src))
+        if not dry_run:
+            m.category, m.category_source = new_cat, new_src
+
+    if not dry_run and changed:
+        registry.save()
+
+    if json_output:
+        print(json.dumps({
+            "changed": [{"id": i, "from": o, "to": n, "source": s} for i, o, n, s in changed],
+            "skipped": [{"id": i, "from": o, "to": n, "source": s} for i, o, n, s in skipped],
+            "dry_run": dry_run,
+        }, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    verb = "would change" if dry_run else "changed"
+    for i, o, n, s in changed:
+        print(f"  {i}: {o or '∅'} → {n}  [{s}]  {verb}")
+    for i, o, n, s in skipped:
+        print(f"  {i}: {o or '∅'} ↛ {n}  [{s}]  skipped (weaker signal; use --force)")
+    if not changed and not skipped:
+        print("All categories already match their metadata.")
+    elif not dry_run and changed:
+        print(f"Updated {len(changed)} model(s).")
+    return EXIT_OK
 
 
 def _now_iso() -> str:
@@ -4874,6 +5158,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("scan", help="Scan engine directories for models")
     p.add_argument("--engine", type=str, default="", help="Scan specific engine only")
 
+    # recategorize
+    p = sub.add_parser("recategorize", help="Re-classify model categories from their shipped metadata")
+    p.add_argument("model_id", nargs="?", default="", help="Model to recategorize (omit with --all)")
+    p.add_argument("--all", dest="all_models", action="store_true", help="Recategorize every model")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="Show changes without applying")
+    p.add_argument("--force", action="store_true", help="Override even stronger/manual categories")
+    p.add_argument("--json", dest="json_output", action="store_true", help="JSON output")
+
     # list
     p = sub.add_parser("list", help="List registered models")
     p.add_argument("--engine", type=str, default="", help="Filter by engine")
@@ -5233,6 +5525,14 @@ def main() -> int:
 
     elif cmd == "delete":
         op_delete(config, registry, args.model_id, force=args.force)
+
+    elif cmd == "recategorize":
+        if not args.all_models and not args.model_id:
+            print("Usage: aim recategorize <model_id> | --all  [--dry-run] [--force]", file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        return op_recategorize(config, registry, model_id=args.model_id,
+                               all_models=args.all_models, dry_run=args.dry_run,
+                               force=args.force, json_output=args.json_output)
 
     elif cmd == "root":
         if args.root_command == "add":
