@@ -3265,12 +3265,45 @@ def op_download(config: dict, registry: Registry, source_str: str,
     return EXIT_OK
 
 
+def _try_install_aria2() -> bool:
+    """Best-effort install of aria2c (hfd's parallel downloader) when missing. Tries no-sudo
+    managers first (conda/brew), then ``sudo -n`` apt/dnf (fast-fails without passwordless sudo).
+    Non-fatal — returns True iff aria2c is on PATH afterwards; callers fall back to the ``hf`` CLI
+    (pure-Python, no aria2c) on False so HF downloads still work on boxes without aria2c."""
+    if shutil.which("aria2c"):
+        return True
+    attempts: list[list[str]] = []
+    if shutil.which("conda"):
+        attempts.append(["conda", "install", "-y", "-c", "conda-forge", "aria2"])
+    if shutil.which("brew"):
+        attempts.append(["brew", "install", "aria2"])
+    if shutil.which("apt-get"):
+        attempts.append(["sudo", "-n", "apt-get", "install", "-y", "aria2"])
+    if shutil.which("dnf"):
+        attempts.append(["sudo", "-n", "dnf", "install", "-y", "aria2"])
+    for cmd in attempts:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        except Exception:
+            continue
+        if shutil.which("aria2c"):
+            return True
+    return shutil.which("aria2c") is not None
+
+
 def _download_hf(repo_id: str, dest: Path, config: dict, options: DownloadOptions, job_state: dict, on_progress: Optional[Any] = None) -> DownloadResult:
     tool = config.get("defaults", {}).get("hf_download_tool", "hfd")
     hfd_path = Path(config.get("roots", [{}])[0].get("path", "")) / "hfd.sh"
     backend_name = "hf"
 
-    if tool == "hfd" and hfd_path.exists():
+    use_hfd = tool == "hfd" and hfd_path.exists()
+    if use_hfd and not shutil.which("aria2c"):
+        # hfd.sh hard-requires aria2c. Try a best-effort auto-install; if it can't be installed
+        # (no package manager / no sudo) fall through to the `hf` CLI (no aria2c needed) so the
+        # download still succeeds instead of erroring "aria2c is not installed".
+        _try_install_aria2()
+        use_hfd = bool(shutil.which("aria2c"))
+    if use_hfd:
         cmd = ["bash", str(hfd_path), repo_id, "--local-dir", str(dest)]
         backend_name = "hfd"
     elif shutil.which("hf"):
