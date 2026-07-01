@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ from typing import Any, Optional
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 AIM_HOME = Path.home() / ".aim"
 CONFIG_FILE = "config.json"
 REGISTRY_FILE = "registry.json"
@@ -1585,22 +1586,63 @@ def _read_job_state(job_id: str) -> Optional[dict]:
         return json.load(f)
 
 
+# Tracks whether a carriage-return progress line is currently "open" on the
+# terminal, so the next full-line message can break to a fresh line first.
+_PROGRESS_TTY_STATE = {"active": False}
+
+
+def _format_download_line(event: dict) -> str:
+    """Human-readable one-line progress: filename, percent (or bytes), speed, ETA."""
+    status = event.get("status", "unknown")
+    parts: list[str] = []
+    cf = event.get("current_file")
+    if cf:
+        parts.append(str(cf))
+    percent = event.get("percent")
+    downloaded = event.get("downloaded_bytes")
+    total = event.get("total_bytes")
+    if percent is not None:
+        seg = f"{percent:.0f}%"
+        if isinstance(downloaded, (int, float)) and isinstance(total, (int, float)) and total > 0:
+            seg += f" ({format_size(int(downloaded))}/{format_size(int(total))})"
+        parts.append(seg)
+    elif isinstance(downloaded, (int, float)) and downloaded > 0:
+        parts.append(format_size(int(downloaded)))
+    speed = event.get("speed_bps")
+    if isinstance(speed, (int, float)) and speed > 0:
+        parts.append(f"{format_size(int(speed))}/s")
+    eta = event.get("eta_seconds")
+    if isinstance(eta, (int, float)) and eta > 0:
+        parts.append(f"ETA {_format_duration(eta)}")
+    return f"[{status}] " + "  ".join(parts) if parts else f"[{status}]"
+
+
 def _emit_download_event(json_output: bool, event: dict) -> None:
     if json_output:
         print(json.dumps(event, ensure_ascii=False))
         return
     status = event.get("status", "unknown")
-    percent = event.get("percent")
-    if percent is not None:
-        print(f"[{status}] {percent:.0f}%")
-    else:
-        print(f"[{status}]")
+    line = _format_download_line(event)
+    # In-place refresh on a TTY while actively downloading; plain lines otherwise
+    # (piped output, CI) so logs stay readable.
+    if status == "downloading" and sys.stdout.isatty():
+        sys.stdout.write("\r" + line + "\033[K")
+        sys.stdout.flush()
+        _PROGRESS_TTY_STATE["active"] = True
+        return
+    if _PROGRESS_TTY_STATE["active"]:
+        sys.stdout.write("\n")
+        _PROGRESS_TTY_STATE["active"] = False
+    print(line)
 
 
 def _emit_download_summary(json_output: bool, summary: dict) -> None:
     if json_output:
         print(json.dumps(summary, ensure_ascii=False))
         return
+    if _PROGRESS_TTY_STATE["active"]:
+        sys.stdout.write("\n")
+        _PROGRESS_TTY_STATE["active"] = False
     if summary.get("status") == "completed":
         print(f"Registered: {summary['model_id']} ({format_size(summary.get('size_bytes', 0))})")
         print(f"Path: {summary.get('path', '')}")
@@ -2523,6 +2565,123 @@ def _parse_eta_to_seconds(token: str) -> Optional[float]:
     return total if found else None
 
 
+# Source types whose backends fetch MANY files into the destination directory
+# (each file reporting its own progress). Per-file percentages are meaningless as
+# an aggregate, so their progress is driven by on-disk bytes instead — see
+# _multifile_filter() and the directory sampler in _download_orchestrate().
+_MULTI_FILE_SOURCE_TYPES = {"modelscope", "huggingface"}
+
+
+def _download_dir_size(path: Path) -> int:
+    """Sum bytes actually written to disk under ``path`` (aggregate progress).
+
+    Uses allocated blocks (``st_blocks``) capped at the logical size, so aria2's
+    sparse/pre-seeked in-progress files report true downloaded bytes rather than
+    their inflated logical size. Skips ``.aria2`` control files and symlinks.
+    Returns 0 if the directory does not exist."""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                if name.endswith(".aria2"):
+                    continue
+                fp = os.path.join(root, name)
+                try:
+                    if os.path.islink(fp):
+                        continue
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                blocks = getattr(st, "st_blocks", 0)
+                if blocks:
+                    total += min(st.st_size, blocks * 512)
+                else:
+                    total += st.st_size
+    except OSError:
+        return total
+    return total
+
+
+def _fetch_remote_total_size(source: dict, proxy: str = "") -> int:
+    """Best-effort total download size (bytes) from the backend's file-listing API.
+
+    Enables a real percentage for multi-file downloads whose backends write to a
+    temp dir (so on-disk bytes alone give no total). Returns 0 on any failure, so
+    callers gracefully fall back to byte-only progress."""
+    import urllib.request
+
+    stype = source.get("type")
+    repo = source.get("repo_id", "")
+    if not repo:
+        return 0
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy
+            else urllib.request.ProxyHandler()
+        )
+        if stype == "huggingface":
+            url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=1"
+            with opener.open(url, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            return sum(int(e.get("size", 0)) for e in data if e.get("type") == "file")
+        if stype == "modelscope":
+            url = f"https://modelscope.cn/api/v1/models/{repo}/repo/files?Revision=master&Recursive=true"
+            with opener.open(url, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            files = data.get("Data", {}).get("Files", []) or []
+            return sum(int(f.get("Size", 0)) for f in files if f.get("Type") == "blob")
+    except Exception:
+        return 0
+    return 0
+
+
+def _multifile_filter(progress: dict, is_multi_file: bool) -> Optional[dict]:
+    """Decide whether a progress tick should drive the job's aggregate progress.
+
+    For multi-file downloads, percent/downloaded/total parsed from a single line
+    of backend stdout describe ONE file, not the whole job — applying them would
+    lock the job at 100% as soon as the first small file finishes. Such per-file
+    ticks are ignored entirely (return ``None``); progress is driven solely by the
+    on-disk sampler, whose ticks are flagged ``aggregate`` and pass through."""
+    if not is_multi_file or progress.get("aggregate"):
+        return progress
+    return None
+
+
+def _active_download_file(dest: Path) -> str:
+    """Name of the file currently being downloaded, for progress display.
+
+    aria2-backed downloads (hfd / modelscope) leave a ``<file>.aria2`` control
+    file next to each in-progress file; modelscope also stages bytes under
+    ``._____temp/``. Returns "" if nothing is clearly in flight."""
+    try:
+        aria = sorted(Path(dest).rglob("*.aria2"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if aria:
+            return aria[0].name[: -len(".aria2")]
+        temp = Path(dest) / "._____temp"
+        if temp.is_dir():
+            files = [f for f in temp.rglob("*") if f.is_file()]
+            if files:
+                return max(files, key=lambda p: p.stat().st_size).name
+    except OSError:
+        pass
+    return ""
+
+
+def _format_duration(seconds: float) -> str:
+    """Compact ETA formatting: 45s / 3m20s / 1h12m."""
+    try:
+        s = int(max(0, seconds))
+    except (TypeError, ValueError):
+        return ""
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
 def _parse_progress_line(line: str, backend_tool: str = "") -> Optional[dict]:
     text = (line or "").strip()
     if not text:
@@ -3003,8 +3162,26 @@ def op_download(config: dict, registry: Registry, source_str: str,
         "last_sample_time": None,
         "last_sample_downloaded": 0,
     }
+    # Multi-file backends (modelscope / hfd) report per-file progress; drive the
+    # aggregate from on-disk bytes instead so one finished small file can't lock
+    # the whole job at 100%.
+    is_multi_file = source["type"] in _MULTI_FILE_SOURCE_TYPES
+    progress_lock = threading.Lock()
 
     def _on_progress(progress: dict) -> None:
+        applied = _multifile_filter(progress, is_multi_file)
+        if applied is None:
+            # Per-file tick from a multi-file backend: record the backend name but
+            # do not touch aggregate state (speed/bytes come from the sampler only).
+            bt = progress.get("backend_tool")
+            if bt:
+                with progress_lock:
+                    progress_state["backend_tool"] = bt
+            return
+        with progress_lock:
+            _on_progress_locked(applied)
+
+    def _on_progress_locked(progress: dict) -> None:
         now = time.time()
         if progress.get("backend_tool"):
             progress_state["backend_tool"] = progress.get("backend_tool")
@@ -3087,6 +3264,7 @@ def op_download(config: dict, registry: Registry, source_str: str,
             "eta_seconds": eta,
             "downloaded_bytes": downloaded,
             "total_bytes": total,
+            "current_file": progress.get("current_file", ""),
         }
         latest_state = _read_job_state(job_id) or {}
         if latest_state.get("cancel_requested"):
@@ -3103,6 +3281,36 @@ def op_download(config: dict, registry: Registry, source_str: str,
         _write_job_state(job_id, job_state)
         if not options.no_progress:
             _emit_download_event(json_output, evt)
+
+    # For multi-file backends, poll the destination directory for real bytes-on-disk
+    # and feed them as aggregate progress (per-file backend output is ignored above).
+    sampler_stop = threading.Event()
+    sampler_thread: Optional[threading.Thread] = None
+    if is_multi_file:
+        backend_hint = ("modelscope" if source["type"] == "modelscope"
+                        else config.get("defaults", {}).get("hf_download_tool", "hfd"))
+
+        def _sample_dir() -> None:
+            # Fetch the full repo size once so progress can be shown as a percentage
+            # (best-effort; falls back to raw bytes if the API is unreachable).
+            total = _fetch_remote_total_size(source, options.proxy)
+            while not sampler_stop.wait(1.0):
+                try:
+                    size = _download_dir_size(dest)
+                except Exception:
+                    continue
+                if size > 0:
+                    tick = {"downloaded_bytes": size, "aggregate": True,
+                            "backend_tool": backend_hint}
+                    if total > 0:
+                        tick["total_bytes"] = total
+                    cf = _active_download_file(dest)
+                    if cf:
+                        tick["current_file"] = cf
+                    _on_progress(tick)
+
+        sampler_thread = threading.Thread(target=_sample_dir, daemon=True)
+        sampler_thread.start()
 
     try:
         if source["type"] == "huggingface":
@@ -3125,6 +3333,10 @@ def op_download(config: dict, registry: Registry, source_str: str,
             error_code="CANCELED",
             error_message="Canceled by user",
         )
+    finally:
+        sampler_stop.set()
+        if sampler_thread is not None:
+            sampler_thread.join(timeout=2.0)
 
     duration_ms = int((time.time() - start) * 1000)
 
@@ -3453,8 +3665,9 @@ def _download_url(url: str, dest: Path, options: DownloadOptions, job_state: dic
 
 def _download_modelscope(repo_id: str, dest: Path, options: DownloadOptions, job_state: dict, on_progress: Optional[Any] = None) -> DownloadResult:
     cmd = ["modelscope", "download", "--model", repo_id, "--local_dir", str(dest)]
-    if options.timeout:
-        cmd.extend(["--timeout", str(options.timeout)])
+    # NOTE: the modelscope CLI has no --timeout flag; passing one aborts the whole
+    # download with "unrecognized arguments". options.timeout is therefore not
+    # forwarded here. Tuning (e.g. --max-workers) can be supplied via --backend-arg.
     cmd.extend(options.backend_args or [])
     env = os.environ.copy()
     if options.proxy:
