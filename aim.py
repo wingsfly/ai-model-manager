@@ -1573,17 +1573,29 @@ def _write_job_state(job_id: str, state: dict) -> None:
                 state["cancel_requested"] = True
         except (json.JSONDecodeError, OSError):
             pass
-    with open(fp, "w") as f:
+    # Atomic write: the progress monitor thread reads this file concurrently; a plain
+    # open(fp,"w") truncates it to empty BEFORE json.dump runs, so a mid-write reader sees
+    # 0 bytes → JSONDecodeError. Write a temp sibling then os.replace (atomic same-fs rename)
+    # so readers always see either the whole old or the whole new content.
+    tmp = fp.parent / (fp.name + f".tmp{os.getpid()}")
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
         f.write("\n")
+    os.replace(tmp, fp)
 
 
 def _read_job_state(job_id: str) -> Optional[dict]:
     fp = _job_file(job_id)
     if not fp.exists():
         return None
-    with open(fp) as f:
-        return json.load(f)
+    try:
+        with open(fp) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        # A concurrent/interrupted write can leave the file momentarily empty or partial;
+        # treat as "no state yet" (the writer re-materialises it next tick) instead of
+        # crashing the download. Mirrors _write_job_state's own prev-read guard.
+        return None
 
 
 # Tracks whether a carriage-return progress line is currently "open" on the
