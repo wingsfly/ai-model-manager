@@ -41,5 +41,23 @@ class IngestAllRobustnessTests(unittest.TestCase):
         self.assertEqual(done, 2)  # two succeeded
 
 
+class HfReadNativeStaleRefTests(unittest.TestCase):
+    def test_read_native_uses_existing_snapshot_when_ref_dangling(self):
+        # refs/main points to a commit whose snapshot dir is GONE (e.g. an interrupted download);
+        # only a DIFFERENT snapshot actually exists. _hf_read_native must report the REAL snapshot's
+        # commit — not the stale ref — else the ingest rebuilds/refs a dangling snapshot and a later
+        # HF resolve of the true commit re-fetches / fails "cannot find files".
+        root = Path(tempfile.mkdtemp())
+        repo = root / "models--Org--Model"
+        (repo / "refs").mkdir(parents=True)
+        (repo / "refs" / "main").write_text("staledeadbeef")   # snapshots/staledeadbeef absent
+        snap = repo / "snapshots" / "realcommit00"
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        info = aim._hf_read_native(repo)
+        self.assertEqual(info["commit"], "realcommit00")       # real snapshot, NOT the stale ref
+        self.assertTrue(any(f["name"] == "config.json" for f in info["files"]))
+
+
 if __name__ == "__main__":
     unittest.main()

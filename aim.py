@@ -4610,7 +4610,11 @@ def _hf_read_native(repo_dir: Path) -> dict:
         snaps = [d for d in snaps_dir.iterdir() if d.is_dir()] if snaps_dir.exists() else []
         if snaps:
             snap = snaps[0]
-            commit = commit or snap.name
+            # Use the snapshot that ACTUALLY exists as the commit — NOT a stale refs/main value
+            # whose snapshot dir is gone (e.g. left by an interrupted download). Keeping the stale
+            # commit made the ingest rebuild snapshots/<stale> + write refs/main=<stale>, so a
+            # later HF resolve of the real commit re-fetches / fails "cannot find files".
+            commit = snap.name
     files = []
     if commit and snap.is_dir():
         for f in sorted(snap.rglob("*")):
