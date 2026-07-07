@@ -300,6 +300,7 @@ class StorageRoot:
     path: str
     label: str = ""
     priority: int = 1
+    removable: bool = False  # external/removable drive: offloaded models live here
 
     @property
     def store_path(self) -> Path:
@@ -348,6 +349,10 @@ class ModelEntry:
     # {"class": "managed-hf|managed-ollama|managed-ms|managed-flat",
     #  "store_path": "<relative-to-root>", "ingested_at": str, "shims": [ {...} ]}
     storage: dict = field(default_factory=dict)
+    # Offload record (absent/empty = online). When status == "offline" the model's
+    # bytes live on a removable root; verify/scan/orphans skip it. See docs/offload-restore-design.md.
+    # {"status": "offline", "root": <root_id>, "path": <rel>, "source": <hf:...>, "offloaded_at": str}
+    offload: dict = field(default_factory=dict)
     added_at: str = ""
 
     def to_dict(self) -> dict:
@@ -498,6 +503,38 @@ def get_primary_root(config: dict) -> StorageRoot:
     if not roots:
         return StorageRoot(id="primary", path=str(Path.home() / "AI"))
     return min(roots, key=lambda r: r.priority)
+
+
+def get_root_by_id(config: dict, root_id: str) -> Optional[StorageRoot]:
+    for r in get_roots(config):
+        if r.id == root_id:
+            return r
+    return None
+
+
+def root_available(root: StorageRoot) -> bool:
+    """True when the root's path is currently reachable (mounted). Derived, never
+    persisted, so unplug/replug needs no bookkeeping."""
+    try:
+        return Path(root.path).exists()
+    except OSError:
+        return False
+
+
+def is_offloaded(entry: ModelEntry) -> bool:
+    return bool(entry.offload) and entry.offload.get("status") == "offline"
+
+
+def offload_status_label(entry: ModelEntry, config: dict) -> str:
+    """Human marker for an offloaded model: '' when online, else an offline note
+    that distinguishes 'drive not mounted' from merely offloaded."""
+    if not is_offloaded(entry):
+        return ""
+    root_id = entry.offload.get("root", "?")
+    root = get_root_by_id(config, root_id)
+    if root is None or not root_available(root):
+        return f"⚠ offline ({root_id} not mounted)"
+    return f"⚠ offline (on {root_id})"
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
@@ -3994,6 +4031,193 @@ def op_migrate(config: dict, registry: Registry, model_id: str, to_root_id: str)
     return True
 
 
+def _source_to_download_str(source: dict) -> str:
+    """Reconstruct an `aim download` source string from a model's source dict, so an
+    offloaded model can always be re-fetched even if the external drive is lost."""
+    t = (source or {}).get("type", "")
+    if t == "huggingface":
+        return f"hf:{source.get('repo_id', '')}"
+    if t == "modelscope":
+        return f"ms:{source.get('repo_id', '')}"
+    if t == "ollama":
+        tag = source.get("tag", "")
+        return f"ollama:{source.get('repo_id', '').split('/')[-1]}" + (f":{tag}" if tag else "")
+    if t == "url":
+        return f"url:{source.get('url', '')}"
+    return ""
+
+
+def _hf_cache_repo_for(config: dict, root: StorageRoot, repo_id: str) -> Path:
+    model_dir = config.get("engines", {}).get("huggingface", {}).get("model_dir", "huggingface/hub")
+    return Path(root.path) / model_dir / ("models--" + repo_id.replace("/", "--"))
+
+
+def op_offload(config: dict, registry: Registry, model_id: str, to_root_id: str,
+               keep_cache: bool = False, json_output: bool = False) -> bool:
+    """Archive a model's bytes to a removable root and mark it offline.
+
+    native_cas models are ingested DIRECTLY to the target root (no transient second
+    copy on the main disk); already-managed models have their store dir moved."""
+    entry = registry.find(model_id)
+    if not entry:
+        print(f"Error: model '{model_id}' not found.", file=sys.stderr)
+        return False
+    if is_offloaded(entry):
+        print(f"'{model_id}' is already offloaded (on {entry.offload.get('root')}).", file=sys.stderr)
+        return False
+    dst = get_root_by_id(config, to_root_id)
+    if dst is None:
+        print(f"Error: root '{to_root_id}' not found. Add it with `aim root add`.", file=sys.stderr)
+        return False
+    if not root_available(dst):
+        print(f"Error: target root '{to_root_id}' is not mounted ({dst.path}).", file=sys.stderr)
+        return False
+
+    cat = entry.category or "uncategorized"
+    dst_dir = dst.store_path / cat / entry.id
+    rel_path = str(dst_dir.relative_to(Path(dst.path)))
+    if dst_dir.exists():
+        print(f"Error: destination already exists: {dst_dir}", file=sys.stderr)
+        return False
+    source_str = _source_to_download_str(entry.source)
+
+    if entry.native_cas:
+        tool = entry.source.get("type", "")
+        primary = get_primary_root(config)
+        cache_repo = Path(entry.canonical.get("path", ""))
+        if not cache_repo.is_absolute():
+            cache_repo = Path(primary.path) / entry.canonical.get("path", "")
+        if tool == "huggingface":
+            info = _hf_read_native(cache_repo)
+        elif tool == "modelscope":
+            info = _ms_read_native(cache_repo)
+        else:
+            print(f"Error: cannot offload native '{tool}' model '{model_id}'.", file=sys.stderr)
+            return False
+        size = _ingest_to_store(info["files"], dst_dir)
+        entry.storage = {
+            "class": f"managed-{tool}", "store_path": rel_path, "ingested_at": _now_iso(),
+            "shims": [{"tool": tool, "kind": f"{tool}-cas",
+                       "reconstruct": {"repo_id": info.get("repo_id", ""),
+                                       "commit": info.get("commit", ""),
+                                       "files": [f["name"] for f in info["files"]]}}],
+        }
+        entry.native_cas = False
+        entry.size_bytes = size
+        if not keep_cache:
+            for sub in ("blobs", "snapshots", "refs"):
+                p = cache_repo / sub
+                if p.exists():
+                    shutil.rmtree(p, ignore_errors=True)
+    else:
+        src_root = get_root_by_id(config, entry.canonical.get("root", "primary")) or get_primary_root(config)
+        src_dir = Path(src_root.path) / entry.canonical.get("path", "")
+        if not src_dir.exists():
+            print(f"Error: source path missing: {src_dir}", file=sys.stderr)
+            return False
+        dst_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_dir), str(dst_dir))
+        for p in entry.provisions:
+            LinkManager.remove_link(Path(src_root.path) / p["target"])
+
+    entry.canonical = {"root": to_root_id, "path": rel_path}
+    entry.offload = {"status": "offline", "root": to_root_id, "path": rel_path,
+                     "source": source_str, "offloaded_at": _now_iso()}
+    registry.save()
+    print(f"Offloaded {model_id} → {to_root_id} ({rel_path}). Main disk freed.")
+    return True
+
+
+def op_offload_restore(config: dict, registry: Registry, model_id: str,
+                       json_output: bool = False) -> bool:
+    """Bring an offloaded model back to the primary root and re-attach it to aim."""
+    entry = registry.find(model_id)
+    if not entry:
+        print(f"Error: model '{model_id}' not found.", file=sys.stderr)
+        return False
+    if not is_offloaded(entry):
+        print(f"'{model_id}' is not offloaded.", file=sys.stderr)
+        return False
+    off = entry.offload
+    src_root = get_root_by_id(config, off.get("root", ""))
+    src_str = off.get("source", "") or _source_to_download_str(entry.source)
+    if src_root is None or not root_available(src_root):
+        print(f"Cannot restore '{model_id}': root '{off.get('root')}' is not mounted.\n"
+              f"  → mount the drive, or re-download:  aim download {src_str}", file=sys.stderr)
+        return False
+    src_dir = Path(src_root.path) / off.get("path", "")
+    if not src_dir.exists():
+        print(f"Error: offloaded data missing at {src_dir}.\n"
+              f"  → re-download:  aim download {src_str}", file=sys.stderr)
+        return False
+
+    primary = get_primary_root(config)
+    cat = entry.category or "uncategorized"
+    dst_dir = primary.store_path / cat / entry.id
+    rel_path = str(dst_dir.relative_to(Path(primary.path)))
+    if dst_dir.exists():
+        print(f"Error: target already exists on primary: {dst_dir}", file=sys.stderr)
+        return False
+    dst_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src_dir), str(dst_dir))
+    entry.canonical = {"root": primary.id, "path": rel_path}
+    entry.offload = {}
+
+    # rebuild engine provisions on the primary root
+    new_provs: list[dict] = []
+    for p in entry.provisions:
+        eng = p.get("engine", "")
+        if eng in ADAPTERS:
+            try:
+                adapter = get_adapter(eng, config, primary)
+                new_provs.extend([asdict(np) for np in adapter.provision(entry, dst_dir)])
+            except OSError as ex:
+                print(f"  ⚠ could not re-provision {eng}: {ex}", file=sys.stderr)
+    if new_provs:
+        entry.provisions = new_provs
+
+    # best-effort: rebuild the HF load shim so cache-based tools see it again
+    shims = (entry.storage or {}).get("shims", [])
+    for sh in shims:
+        rc = sh.get("reconstruct", {})
+        if sh.get("tool") == "huggingface" and rc.get("repo_id") and rc.get("commit"):
+            try:
+                cache_repo = _hf_cache_repo_for(config, primary, rc["repo_id"])
+                _hf_build_shim(cache_repo, dst_dir, rc["commit"],
+                               [{"name": n} for n in rc.get("files", [])])
+            except OSError as ex:
+                print(f"  ⚠ HF shim not rebuilt (model still usable from store): {ex}", file=sys.stderr)
+
+    registry.save()
+    print(f"Restored {model_id} → {primary.id} ({rel_path}).")
+    return True
+
+
+def op_offload_list(config: dict, registry: Registry, json_output: bool = False) -> list[dict]:
+    """List offloaded models with their root and mount state."""
+    rows = []
+    for m in registry.models:
+        if not is_offloaded(m):
+            continue
+        root_id = m.offload.get("root", "?")
+        root = get_root_by_id(config, root_id)
+        mounted = bool(root and root_available(root))
+        rows.append({"id": m.id, "root": root_id, "mounted": mounted,
+                     "path": m.offload.get("path", ""), "size_bytes": m.size_bytes,
+                     "source": m.offload.get("source", "")})
+    if json_output:
+        print(json.dumps({"offloaded": rows}, ensure_ascii=False))
+        return rows
+    if not rows:
+        print("No offloaded models.")
+        return rows
+    print(f"{'ID':<45} {'Root':<10} {'Mounted':<8} {'Size':<10}")
+    print("─" * 75)
+    for r in rows:
+        print(f"{r['id'][:45]:<45} {r['root']:<10} {'yes' if r['mounted'] else 'NO':<8} {format_size(r['size_bytes']):<10}")
+    return rows
+
+
 def op_import(
     config: dict,
     registry: Registry,
@@ -4190,6 +4414,8 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
     for model in registry.models:
         if model.native_cas:
             continue
+        if is_offloaded(model):
+            continue  # offloaded to a removable root — not a missing-canonical error
 
         canonical = Path(root.path) / model.canonical.get("path", "")
         if not canonical.exists():
@@ -4245,7 +4471,7 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
     # External (out-of-root) deps registered via `aim link` — checked for all
     # models (incl. native-CAS, which the loop above skips).
     for model in registry.models:
-        if not model.external_links:
+        if not model.external_links or is_offloaded(model):
             continue
         canonical = _canonical_abs(get_primary_root(config), model).resolve()
         for e in model.external_links:
@@ -4565,7 +4791,7 @@ def op_organize(config: dict, registry: Registry, model_id: str = "",
     return organized
 
 
-def op_root_add(config: dict, path: str, label: str = "") -> None:
+def op_root_add(config: dict, path: str, label: str = "", removable: bool = False) -> None:
     """Add a new storage root."""
     root_path = Path(path).expanduser().resolve()
     if not root_path.exists():
@@ -4578,7 +4804,8 @@ def op_root_add(config: dict, path: str, label: str = "") -> None:
     while rid in existing_ids:
         rid += "-1"
 
-    new_root = {"id": rid, "path": str(root_path), "label": label or str(root_path), "priority": len(existing_ids) + 1}
+    new_root = {"id": rid, "path": str(root_path), "label": label or str(root_path),
+                "priority": len(existing_ids) + 1, "removable": removable}
     config.setdefault("roots", []).append(new_root)
 
     # Create store in new root (supports both "/.../AI" and "/.../AI/store")
@@ -5317,6 +5544,8 @@ def display_model_list(models: list[ModelEntry], show_provisions: bool = False) 
 
     for m in models:
         engines_str = ", ".join(sorted(_get_engines(m)))
+        if is_offloaded(m):
+            engines_str = (engines_str + "  " if engines_str else "") + f"⚠ offline (on {m.offload.get('root', '?')})"
 
         print(f"{m.id:<35} {m.name[:29]:<30} {m.category:<22} {m.format:<15} {format_size(m.size_bytes):<12} {engines_str}")
 
@@ -5335,6 +5564,10 @@ def display_model_info(model: ModelEntry, show_provisions: bool = False) -> None
     print(f"Size:       {format_size(model.size_bytes)}")
     print(f"Source:     {json.dumps(model.source)}")
     print(f"Canonical:  {model.canonical.get('root', '?')}:{model.canonical.get('path', '?')}")
+    if is_offloaded(model):
+        print(f"Offload:    ⚠ offline on '{model.offload.get('root', '?')}' "
+              f"({model.offload.get('path', '')}) — `aim offload {model.id} --restore` or "
+              f"`aim download {model.offload.get('source', '')}`")
     print(f"Native CAS: {model.native_cas}")
     print(f"Engines:    {', '.join(sorted(_get_engines(model)))}")
     print(f"Tags:       {', '.join(model.tags)}")
@@ -5529,6 +5762,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = root_sub.add_parser("add", help="Add a storage root")
     p.add_argument("path", type=str)
     p.add_argument("--label", type=str, default="", help="Human-readable label")
+    p.add_argument("--removable", action="store_true", help="Mark as external/removable drive (for offload)")
     root_sub.add_parser("list", help="List storage roots")
 
     # migrate
@@ -5536,6 +5770,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("model_id", nargs="?", default="", type=str)
     p.add_argument("--to", type=str, required=True, dest="to_root", help="Target root ID")
     p.add_argument("--category", type=str, default="", help="Migrate all models in category")
+
+    # offload / restore (offline-aware archival to a removable root)
+    p = sub.add_parser("offload", help="Archive a model to a removable root (offline), or restore it")
+    p.add_argument("model_id", nargs="?", default="", type=str, help="Model ID (omit with --list)")
+    p.add_argument("--to", type=str, default="", dest="to_root", help="Target removable root ID (offload)")
+    p.add_argument("--restore", action="store_true", help="Bring the model back to the primary root")
+    p.add_argument("--list", action="store_true", dest="offload_list", help="List offloaded models")
+    p.add_argument("--keep-cache", action="store_true", help="Keep original HF/MS cache bytes (default: remove)")
+    p.add_argument("--json", action="store_true", help="JSON output")
 
     # import
     p = sub.add_parser("import", help="Import/register an existing local model path")
@@ -5798,7 +6041,7 @@ def main() -> int:
 
     elif cmd == "root":
         if args.root_command == "add":
-            op_root_add(config, args.path, label=args.label)
+            op_root_add(config, args.path, label=args.label, removable=args.removable)
         elif args.root_command == "list":
             op_root_list(config)
         else:
@@ -5815,6 +6058,25 @@ def main() -> int:
         else:
             print("Usage: aim migrate MODEL_ID --to ROOT_ID")
             print("       aim migrate --category CAT --to ROOT_ID")
+
+    elif cmd == "offload":
+        if args.offload_list or (not args.model_id and not args.to_root and not args.restore):
+            op_offload_list(config, registry, json_output=args.json)
+        elif args.restore:
+            if not args.model_id:
+                print("Usage: aim offload MODEL_ID --restore")
+                return EXIT_INVALID_ARGS
+            ok = op_offload_restore(config, registry, args.model_id, json_output=args.json)
+            return EXIT_OK if ok else EXIT_FAILED
+        elif args.model_id and args.to_root:
+            ok = op_offload(config, registry, args.model_id, args.to_root,
+                            keep_cache=args.keep_cache, json_output=args.json)
+            return EXIT_OK if ok else EXIT_FAILED
+        else:
+            print("Usage: aim offload MODEL_ID --to ROOT_ID   (archive to removable root)")
+            print("       aim offload MODEL_ID --restore       (bring back)")
+            print("       aim offload --list                   (list offloaded)")
+            return EXIT_INVALID_ARGS
 
     elif cmd == "import":
         if not args.model_id:
