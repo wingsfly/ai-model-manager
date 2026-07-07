@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 AIM_HOME = Path.home() / ".aim"
 CONFIG_FILE = "config.json"
 REGISTRY_FILE = "registry.json"
