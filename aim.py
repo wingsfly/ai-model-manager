@@ -779,6 +779,11 @@ class OllamaAdapter(EngineAdapter):
                 total_size = 0
                 is_cloud = False
                 layers = manifest.get("layers") or []
+                # Ollama cloud-only entries are local manifest stubs with no layers/blobs.
+                # They appear in `ollama list`, but are not local models and must not be
+                # registered by a disk scan.
+                if not layers:
+                    continue
                 for layer in layers:
                     digest = layer.get("digest", "")
                     size = layer.get("size", 0)
@@ -849,7 +854,9 @@ class HuggingFaceAdapter(EngineAdapter):
             if snapshots_dir.exists():
                 for snap in snapshots_dir.iterdir():
                     if snap.is_dir():
-                        for f in snap.iterdir():
+                        for f in snap.rglob("*"):
+                            if not f.is_file():
+                                continue
                             if f.suffix == ".safetensors":
                                 model_format = "safetensors"
                                 break
@@ -862,6 +869,24 @@ class HuggingFaceAdapter(EngineAdapter):
                                 break
                         if model_format:
                             break
+
+            # Managed/migrated HF caches may intentionally have no blobs: snapshot
+            # links point straight at aim's store.  Fall back to the unique resolved
+            # snapshot files so `aim list` does not incorrectly show a healthy model
+            # as 0 B.  Broken links are ignored and reported separately by verify.
+            if total_size == 0 and snapshots_dir.exists():
+                seen_files: set[tuple[int, int]] = set()
+                for f in snapshots_dir.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    try:
+                        st = f.stat()
+                    except OSError:
+                        continue
+                    identity = (st.st_dev, st.st_ino)
+                    if identity not in seen_files:
+                        seen_files.add(identity)
+                        total_size += st.st_size
 
             # classify from the model's shipped metadata (config.json / README), repo id as fallback
             category, category_source = classify_model(
@@ -4095,12 +4120,18 @@ def op_offload(config: dict, registry: Registry, model_id: str, to_root_id: str,
             print(f"Error: cannot offload native '{tool}' model '{model_id}'.", file=sys.stderr)
             return False
         size = _ingest_to_store(info["files"], dst_dir)
+        shim_kind = "hf-cas" if tool == "huggingface" else "ms-dir"
+        reconstruct = ({"repo_id": info.get("repo_id", ""),
+                        "commit": info.get("commit", ""),
+                        "files": [f["name"] for f in info["files"]]}
+                       if tool == "huggingface" else
+                       {"repo_id": entry.source.get("repo_id", ""),
+                        "dir_name": info.get("dir_name", cache_repo.name)})
         entry.storage = {
-            "class": f"managed-{tool}", "store_path": rel_path, "ingested_at": _now_iso(),
-            "shims": [{"tool": tool, "kind": f"{tool}-cas",
-                       "reconstruct": {"repo_id": info.get("repo_id", ""),
-                                       "commit": info.get("commit", ""),
-                                       "files": [f["name"] for f in info["files"]]}}],
+            "class": "managed-hf" if tool == "huggingface" else "managed-ms",
+            "store_path": rel_path, "ingested_at": _now_iso(),
+            "shims": [{"tool": tool, "kind": shim_kind,
+                       "reconstruct": reconstruct}],
         }
         entry.native_cas = False
         entry.size_bytes = size
@@ -4185,6 +4216,11 @@ def op_offload_restore(config: dict, registry: Registry, model_id: str,
                 cache_repo = _hf_cache_repo_for(config, primary, rc["repo_id"])
                 _hf_build_shim(cache_repo, dst_dir, rc["commit"],
                                [{"name": n} for n in rc.get("files", [])])
+                # Normalize annotations written by older offload versions so future
+                # verify/backup/restore operations have a concrete local location.
+                sh["kind"] = "hf-cas"
+                sh["location"] = str(cache_repo)
+                sh["cache_root_var"] = "HF_HOME"
             except OSError as ex:
                 print(f"  ⚠ HF shim not rebuilt (model still usable from store): {ex}", file=sys.stderr)
 
@@ -4488,11 +4524,19 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
 
     # SP2: verify storage shims resolve; rebuild from annotation with --fix.
     for m in registry.models:
+        if is_offloaded(m):
+            # Its store and load shim intentionally live on an unmounted/removable
+            # root.  Keep the annotation so `aim offload --restore` can reconstruct
+            # it later, but do not treat it as a broken local shim.
+            continue
         st = getattr(m, "storage", {}) or {}
         if not st.get("shims"):
             continue
         for shim in st["shims"]:
-            loc = shim["location"]
+            loc = shim.get("location", "")
+            if not loc:
+                issues.append({"model": m.id, "error": "shim_location_missing", "path": ""})
+                continue
             cache_path = Path(loc) if os.path.isabs(loc) else (Path(get_primary_root(config).path) / loc)
             if not (cache_path.exists() or cache_path.is_symlink()):
                 issues.append({"model": m.id, "error": "shim_missing", "path": str(cache_path)})
@@ -4522,11 +4566,13 @@ def op_verify(config: dict, registry: Registry, fix: bool = False) -> list[dict]
                             lt,
                         )
                         print(f"  Fixed: {target}")
-            elif issue.get("error") == "shim_missing":
+            elif issue.get("error") in ("shim_missing", "shim_location_missing"):
                 model_id = issue["model"]
                 model = registry.find(model_id)
                 if model:
                     try:
+                        if issue.get("error") == "shim_location_missing":
+                            _retarget_shim_locations(model, EnvDetector())
                         if _rebuild_shim_from_storage(config, model):
                             print(f"  Rebuilt shim for {model_id}")
                     except Exception as ex:
@@ -5031,17 +5077,22 @@ def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
     store_dir = Path(root.path) / storage.get("store_path", "")
     rebuilt = False
     for shim in storage["shims"]:
-        loc = shim["location"]
+        loc = shim.get("location", "")
+        if not loc:
+            _retarget_shim_locations(entry, EnvDetector())
+            loc = shim.get("location", "")
+        if not loc:
+            continue
         cache_path = Path(loc) if os.path.isabs(loc) else (Path(root.path) / loc)
         rc = shim.get("reconstruct", {})
-        if shim["kind"] == "hf-cas":
+        if shim.get("kind") in ("hf-cas", "huggingface-cas"):
             files = [{"name": n} for n in rc.get("files", [])]
             _hf_build_shim(cache_path, store_dir, rc.get("commit", ""), files)
             rebuilt = True
-        elif shim["kind"] == "ms-dir":
+        elif shim.get("kind") == "ms-dir":
             _ms_build_shim(cache_path, store_dir)
             rebuilt = True
-        elif shim["kind"] == "ollama-cas":
+        elif shim.get("kind") == "ollama-cas":
             models_root = _ollama_models_root(cache_path)
             info = {"gguf": {"digest": rc.get("gguf_digest", "")},
                     "small_blobs": [{"digest": d} for d in rc.get("small_blobs", [])],
@@ -5049,7 +5100,7 @@ def _rebuild_shim_from_storage(config: dict, entry: "ModelEntry") -> bool:
                     "manifest_rel": rc.get("manifest_rel", "")}
             _ollama_build_shim(info, store_dir, models_root)
             rebuilt = True
-        elif shim["kind"] == "flat-file":
+        elif shim.get("kind") == "flat-file":
             store_file = store_dir / rc.get("filename", "")
             _flatfile_build_shim(cache_path, store_file)
             rebuilt = True
@@ -5372,7 +5423,7 @@ def _retarget_shim_locations(entry: "ModelEntry", detector: "EnvDetector") -> No
     for shim in entry.storage.get("shims", []):
         rc = shim.get("reconstruct", {})
         kind = shim.get("kind")
-        if kind == "hf-cas":
+        if kind in ("hf-cas", "huggingface-cas"):
             hub = detector.cache_dir("huggingface")
             org, _, repo = rc.get("repo_id", "").partition("/")
             if hub and org and repo:

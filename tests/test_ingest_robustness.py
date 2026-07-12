@@ -16,6 +16,17 @@ class OllamaNullLayersTests(unittest.TestCase):
         self.assertIsNone(info["gguf"])
         self.assertEqual(info["small_blobs"], [])
 
+    def test_scan_excludes_cloud_stub_with_null_layers(self):
+        root = Path(tempfile.mkdtemp())
+        mpath = root / "manifests" / "registry.ollama.ai" / "library" / "cloud-model" / "latest"
+        mpath.parent.mkdir(parents=True, exist_ok=True)
+        mpath.write_text(json.dumps({"layers": None, "config": None}))
+        cfg = {"roots": [{"id": "primary", "path": str(root)}],
+               "engines": {"ollama": {"enabled": True, "native_cas": True}},
+               "sources": {"ollama": {"cache_path": str(root)}}}
+        adapter = aim.OllamaAdapter(cfg, aim.StorageRoot(id="primary", path=str(root)))
+        self.assertEqual(adapter.scan(), [])
+
 
 class IngestAllRobustnessTests(unittest.TestCase):
     def test_ingest_all_continues_past_exception(self):

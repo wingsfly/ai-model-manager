@@ -116,6 +116,8 @@ class OffloadRestoreTests(unittest.TestCase):
     def test_verify_skips_offloaded(self) -> None:
         e, store = self._managed_model()
         aim.op_offload(self.config, self.reg, "m1", "backup")
+        e.storage = {"shims": [{"tool": "huggingface", "kind": "huggingface-cas",
+                                 "reconstruct": {"repo_id": "org/m1"}}]}
         issues = aim.op_verify(self.config, self.reg)
         self.assertFalse([i for i in issues if i.get("model") == "m1"],
                          "offloaded model must not be reported as missing")
@@ -142,6 +144,15 @@ class OffloadRestoreTests(unittest.TestCase):
         self.assertFalse(e.native_cas, "should be managed after ingest")
         self.assertTrue(aim.is_offloaded(e))
         self.assertFalse((repo / "blobs").exists(), "cache blobs removed by default")
+        self.assertEqual(e.storage["shims"][0]["kind"], "hf-cas")
+        self.assertNotIn("location", e.storage["shims"][0],
+                         "offline annotations should not require a mounted local shim")
+        self.assertTrue(aim.op_offload_restore(self.config, self.reg, "nat"))
+        shim = e.storage["shims"][0]
+        self.assertEqual(shim["kind"], "hf-cas")
+        self.assertEqual(shim["location"], str(repo))
+        self.assertFalse([i for i in aim.op_verify(self.config, self.reg)
+                          if i.get("model") == "nat"])
 
     def test_offload_list(self) -> None:
         e, _ = self._managed_model()
